@@ -152,6 +152,49 @@ CONFIG = {
 | `missing_album_scan_count` | `10` | How many of the oldest missing albums to check per run. Kept low to avoid API rate issues. |
 | `missing_search_threshold` | `2` | If a missing album has been searched this many times with zero successful grabs, flag it as a potential naming issue. |
 
+### Client Overrides
+
+You can set different thresholds per download client. This is useful because different sources have different behavior:
+
+| Setting | What it does |
+|---------|-------------|
+| `stale_download_days` | Override the global stale threshold for this client |
+| `match_import_min` | Override the match % import threshold (lower for low-quality sources like YouTube) |
+| `retrying_message` | If set, the script checks `errorMessage` for this pattern to detect "retrying" state |
+| `retrying_delete_days` | Delete if retrying for this many days (separate from stale) |
+
+**Built-in overrides:**
+
+| Client | Stale days | Match min % | Retrying |
+|--------|-----------|-------------|----------|
+| `Slskd2` (Soulseek) | 14 | 20% | "Some files failed. Retrying download" → delete after 14d |
+| `Youtube` (Tubifarry) | 3 | 15% | — |
+| `Lucida` | 7 | 20% | — |
+| Everything else | 14 (global) | 30 (global) | — |
+
+To add or modify a client, edit the `client_overrides` dict:
+
+```python
+"client_overrides": {
+    "Slskd2": {
+        "stale_download_days": 14,
+        "match_import_min": 20,
+        "retrying_message": "Some files failed. Retrying download",
+        "retrying_delete_days": 14,
+    },
+    "Youtube": {
+        "stale_download_days": 3,
+        "match_import_min": 15,
+    },
+    "MyCustomClient": {
+        "stale_download_days": 7,
+        "match_import_min": 25,
+    },
+},
+```
+
+If a client is not listed, global thresholds apply and retrying detection is disabled.
+
 ### Action Lists
 
 There are four action lists, applied in priority order:
