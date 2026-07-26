@@ -41,8 +41,10 @@ Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cr
 | **Force import** | Albums that failed auto-import but should still work — re-attempts via Lidarr's manual import API with `move` mode |
 | **Delete + re-search** | Genuinely broken downloads are removed from queue and Lidarr re-searches for a better copy |
 | **Agent oversight** | Ambiguous or low-confidence items get flagged with `[AGENT_OVERSIGHT_NEEDED]` for human/AI review |
-| **Stalled download cleanup** | qBittorrent/Soulseek downloads stuck for N+ days are removed and re-searched |
+| **Stalled download cleanup** | qBittorrent/Soulseek/YouTube downloads stuck for N+ days are removed and re-searched |
 | **Missing album scan** | Scans the oldest N missing albums for ones that have been repeatedly searched but never grabbed (likely naming/indexer issues) |
+| **Unmapped files cleanup** | Deletes orphaned track files that are no longer linked to any album in Lidarr |
+| **Tubifarry integration** | Per-download-client config for Slskd2/Soulseek, YouTube, Lucida — handles retrying downloads, lower match thresholds, stale timeout overrides |
 | **Config-driven logic** | All error pattern matching is controlled by a `CONFIG` dict at the top of the script — move keywords between lists to change behavior without touching logic |
 | **Direct Lidarr API** | No MCP server dependency — talks directly to Lidarr's REST API |
 
@@ -152,9 +154,35 @@ CONFIG = {
 | `missing_album_scan_count` | `10` | How many of the oldest missing albums to check per run. Kept low to avoid API rate issues. |
 | `missing_search_threshold` | `2` | If a missing album has been searched this many times with zero successful grabs, flag it as a potential naming issue. |
 
+### Tubifarry Integration
+
+[Tubifarry](https://github.com/TypNull/Tubifarry) is a Lidarr plugin that adds download sources beyond traditional indexers. It registers custom download clients in Lidarr — this script handles each one with specific behavior:
+
+| Download Client | Source | Stale days | Match min % | Retrying detection |
+|----------------|--------|-----------|-------------|--------------------|
+| `Slskd2` | Soulseek (via slskd) | 14 | 20% | `"Some files failed. Retrying download"` → delete after 14d |
+| `Youtube` | YouTube audio (via yt-dlp) | 3 | 15% | — |
+| `Lucida` | Multi-source web client | 7 | 20% | — |
+| Any other client | — | 14 (global default) | 30% (global default) | — |
+
+**Slskd2 / Soulseek**: Soulseek downloads can stall when the peer goes offline. Lidarr reports this with `errorMessage: "Some files failed. Retrying download..."`. The script detects this specific pattern and if the download has been retrying for 14+ days (configurable via `retrying_delete_days`), it removes it from the queue and triggers a new search. Fresh retrying downloads (<14d) are left alone to give the peer time to come back.
+
+**YouTube**: YouTube audio extraction should finish quickly — if a YouTube download is stuck for more than 3 days, it's likely dead. YouTube audio is often lower quality, so the match % threshold for force import is lowered to 15%.
+
+**Lucida**: Multi-source web downloader. 7-day stale threshold with 20% match minimum.
+
+If you add more Tubifarry web clients (DABmusic, T2Tunes, Subsonic, etc.), just add an entry to `client_overrides`:
+
+```python
+"DABmusic": {
+    "stale_download_days": 7,
+    "match_import_min": 25,
+},
+```
+
 ### Client Overrides
 
-You can set different thresholds per download client. This is useful because different sources have different behavior:
+You can set different thresholds per download client (**see [Tubifarry Integration](#tubifarry-integration) above for the built-in values**). This is useful because different sources have different behavior:
 
 | Setting | What it does |
 |---------|-------------|
@@ -162,15 +190,6 @@ You can set different thresholds per download client. This is useful because dif
 | `match_import_min` | Override the match % import threshold (lower for low-quality sources like YouTube) |
 | `retrying_message` | If set, the script checks `errorMessage` for this pattern to detect "retrying" state |
 | `retrying_delete_days` | Delete if retrying for this many days (separate from stale) |
-
-**Built-in overrides:**
-
-| Client | Stale days | Match min % | Retrying |
-|--------|-----------|-------------|----------|
-| `Slskd2` (Soulseek) | 14 | 20% | "Some files failed. Retrying download" → delete after 14d |
-| `Youtube` (Tubifarry) | 3 | 15% | — |
-| `Lucida` | 7 | 20% | — |
-| Everything else | 14 (global) | 30 (global) | — |
 
 To add or modify a client, edit the `client_overrides` dict:
 
