@@ -1,5 +1,7 @@
 # Lidarr Queue Maintenance
 
+> **Disclaimer:** This script was generated entirely by **DeepSeek V4 Flash** (via Hermes Agent) — an AI language model. It was not written by a human. Verify before running in production.
+
 Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cron — handles stuck imports, deletes stale downloads, force-imports borderline matches, and flags problem albums for review.
 
 ## Features
