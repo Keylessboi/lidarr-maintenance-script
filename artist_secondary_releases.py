@@ -7,9 +7,10 @@ artist credit (featured appearances, collaborations, compilations)
 and adds them to Lidarr.
 
 WARNING: Running --all-artists on a large library will add THOUSANDS of
-compilation tracks. Most users want to opt out of this — run with --dry-run
-first and be selective. Target individual artists by their MusicBrainz ID
-instead.
+compilation tracks and take HOURS due to MusicBrainz API rate limiting
+(~1s/call, ~26 calls per artist). For 500 artists, expect ~4-6 hours.
+Most users want to opt out of this — target individual artists by their
+MusicBrainz ID instead, or use --dry-run --max-per-artist 1 to preview.
 
 Requires: pip install requests musicbrainzngs
 
@@ -207,7 +208,15 @@ def main():
         time.sleep(5)
 
     artists = lidarr_get("artist")
-    print(f"\nProcessing {len(artists)} artists from Lidarr...\n")
+    artist_count = len(artists)
+    # Estimate: each artist does ~25+1 MB API calls at MB_SLEEP sec each + overhead
+    est_releases_per_artist = 26  # ~25 releases + 1 secondary check per release
+    est_seconds = artist_count * (est_releases_per_artist * MB_SLEEP + 2)
+    est_hours = est_seconds / 3600
+    print(f"Processing {artist_count} artists from Lidarr...")
+    print(f"  Estimated time: ~{est_hours:.1f} hours ({est_seconds:.0f}s)")
+    print(f"  Due to MusicBrainz API rate limiting (~{MB_SLEEP}s between calls)")
+    print()
 
     totals = {"added": 0, "skipped": 0}
     for i, artist in enumerate(artists, 1):
