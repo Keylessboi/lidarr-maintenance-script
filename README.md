@@ -2,6 +2,12 @@
 
 > **Disclaimer:** This script was generated entirely by **DeepSeek V4 Flash** (via Hermes Agent) — an AI language model. It was not written by a human. Verify before running in production.
 
+[![CI](https://github.com/Keylessboi/lidarr-maintenance-script/actions/workflows/ci.yml/badge.svg)](https://github.com/Keylessboi/lidarr-maintenance-script/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://python.org)
+[![GitHub last commit](https://img.shields.io/github/last-commit/Keylessboi/lidarr-maintenance-script)](https://github.com/Keylessboi/lidarr-maintenance-script/commits/main)
+[![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/Keylessboi/lidarr-maintenance-script/graphs/commit-activity)
+
 Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cron — handles stuck imports, deletes stale downloads, force-imports borderline matches, and flags problem albums for review.
 
 ## Features
