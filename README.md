@@ -241,14 +241,16 @@ Messages are checked **in order** within each list. If an item's status messages
 
 ```
 Queue item
+├── Has errorMessage matching client retrying_pattern?
+│   └── Yes + stale > retrying_delete_days → DELETE + re-search (retrying)
 ├── Has statusMessages?
 │   └── No → skip (active download, no issues)
-├── downloading + stale > N days?
+├── downloading + stale > N days (per-client)?
 │   └── Yes → DELETE + re-search (stalled)
 ├── importFailed?
 │   ├── Matches import_keywords? → FORCE IMPORT
 │   ├── Matches import_if_match_keywords?
-│   │   ├── Match % >= threshold → FORCE IMPORT
+│   │   ├── Match % >= threshold (per-client) → FORCE IMPORT
 │   │   └── Match % < threshold → FLAG FOR OVERSIGHT
 │   ├── Matches delete_keywords? → DELETE + re-search
 │   ├── Matches oversight_keywords? → FLAG FOR OVERSIGHT
