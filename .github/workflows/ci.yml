@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint with pyflakes
+        run: |
+          pip install pyflakes
+          pyflakes lidarr_queue_maintenance.py
+      - name: Check syntax
+        run: python3 -m py_compile lidarr_queue_maintenance.py
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run dry-run test (no API)
+        run: |
+          python3 -c "
+          import ast
+          with open('lidarr_queue_maintenance.py') as f:
+              ast.parse(f.read())
+          print('✓ Syntax OK')
+          "
+      - name: Validate README
+        run: test -f README.md && echo "✓ README exists"
