@@ -9,10 +9,53 @@ from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+# ── CONFIG ──  Change these to tweak behavior without touching the logic below.
+CONFIG = {
+    # Thresholds
+    "match_import_min": 30,          # match % >= this → try force import
+    "match_oversight_max": 30,       # match % < this → flag for agent oversight
+    "stale_download_days": 14,       # downloads stuck this many days → delete + re-search
+    "queue_page_size": 500,          # how many queue records to fetch at once
+    "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
+    "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
+
+    # Action: FORCE IMPORT — items where the files probably exist and just need a nudge.
+    # Move a keyword between lists to change its action.
+    "import_keywords": [
+        "Not an upgrade for existing",           # UpgradeSpecification — quality not better, but files are valid
+        "Album already imported",                # AlreadyImportedSpecification — was imported, just stuck in queue
+        "Failed to import track, Destination already exists",  # File system level — dest file exists, just clean up queue
+        "Has unmatched tracks",                  # NoMissingOrUnmatchedTracksSpecification — extra files, import anyway
+        "could not find similar album",          # Folder/name mismatch, agent should match manually → import
+    ],
+
+    # Action: IMPORT IF MATCH % >= threshold
+    "import_if_match_keywords": [
+        "Album match",                           # CloseAlbumMatchSpecification — "Album match is not close enough: X% vs Y%"
+        "Worst track match",                     # CloseAlbumMatchSpecification — "Worst track match: X% vs Y%"
+        "Track match is not close enough",        # CloseTrackMatchSpecification — individual track match too low
+    ],
+
+    # Action: DELETE + RE-SEARCH — items where the download was genuinely bad/wrong
+    "delete_keywords": [
+        "Has missing tracks",                    # NoMissingOrUnmatchedTracksSpecification — MusicBrainz has tracks missing from this release
+        "Has fewer tracks than existing release", # MoreTracksSpecification — has fewer tracks than what's already on disk
+        "One or more tracks expected",           # Generic wrapper message (no specific reason beneath)
+    ],
+
+    # Action: SKIP / FLAG FOR AGENT OVERSIGHT — needs human/AI judgement
+    # These are moved here when a pattern needs manual review
+    "oversight_keywords": [
+        # "could not find similar album",  — now handled by import_keywords above
+        # Add patterns here to flag them for agent review
+    ],
+}
+# ── END CONFIG ──
+
+
 API_KEY = os.environ.get("LIDARR_API_KEY", "")
 BASE_URL = os.environ.get("LIDARR_URL", "")
 if not API_KEY or not BASE_URL:
-    # Fallback: read from arr-mcp .env
     env_path = "/opt/projects/lidarr-mcp/arr-mcp/.env"
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -108,13 +151,81 @@ def flatten_messages(status_messages):
     return msgs
 
 
+def classify_record(record, now, utc):
+    """
+    Classify a single queue record into an action bucket.
+    Returns (action_bucket, action_data_tuple) or None to skip.
+    """
+    record_id = record.get("id")
+    title = record.get("title", "Unknown")
+    tracked_state = record.get("trackedDownloadState")
+    status_messages = record.get("statusMessages", [])
+    added_str = record.get("added")
+    download_id = record.get("downloadId", "")
+    album_id = record.get("albumId")
+
+    if not status_messages:
+        return None
+
+    sm_str = str(status_messages)
+    sm_lower = sm_str.lower()
+    flat = flatten_messages(status_messages)
+    primary_reason = flat[0] if flat else ""
+
+    # Stale download check
+    is_stale = False
+    if added_str and tracked_state == "downloading":
+        try:
+            added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+            is_stale = (now - added_dt) > timedelta(days=CONFIG["stale_download_days"])
+        except:
+            pass
+
+    if tracked_state == "downloading" and is_stale:
+        return ("delete", (record_id, title, f"stalled >{CONFIG['stale_download_days']}d", album_id))
+
+    if tracked_state != "importFailed":
+        return None
+
+    # Check oversight keywords first (they take priority)
+    for kw in CONFIG["oversight_keywords"]:
+        if kw.lower() in sm_lower:
+            return ("skip", (record_id, title, kw))
+
+    # Check import keywords
+    for kw in CONFIG["import_keywords"]:
+        if kw in sm_str:
+            return ("import", (record_id, download_id, title, kw, album_id))
+
+    # Check import-if-match keywords
+    for kw in CONFIG["import_if_match_keywords"]:
+        if kw in sm_str and download_id:
+            match_pct = parse_match_pct(status_messages)
+            if match_pct is not None and match_pct >= CONFIG["match_import_min"]:
+                return ("import", (record_id, download_id, title, f"match {match_pct}%", album_id))
+            else:
+                return ("skip", (record_id, title, f"match {match_pct}%"))
+
+    # Check delete keywords
+    for kw in CONFIG["delete_keywords"]:
+        if kw in sm_str:
+            return ("delete", (record_id, title, kw, album_id))
+
+    # Unknown
+    return ("unknown", (record_id, title, primary_reason[:100] if primary_reason else "no details"))
+
+
 def main():
-    print(f"Lidarr Queue Maintenance — {datetime.now().isoformat()}")
-    print(f"Target: {BASE_URL}")
-    print()
+    cfg = CONFIG
+    print(f"Lidarr Queue Maintenance — {datetime.now().isoformat()}", flush=True)
+    print(f"Target: {BASE_URL}", flush=True)
+    print(f"Config: match_import_min={cfg['match_import_min']}%"
+          f" | stale_days={cfg['stale_download_days']}"
+          f" | missing_scan={cfg['missing_album_scan_count']}", flush=True)
+    print(flush=True)
 
     resp = api_get("queue", params={
-        "pageSize": 2500,
+        "pageSize": cfg["queue_page_size"],
         "page": 1,
         "sortDirection": "ascending",
         "sortKey": "status",
@@ -122,90 +233,30 @@ def main():
     })
 
     if "error" in resp:
-        print(f"ERROR fetching queue: {resp['error']}")
+        print(f"ERROR fetching queue: {resp['error']}", flush=True)
         sys.exit(1)
 
     records = resp.get("records", [])
     total = resp.get("totalRecords", 0)
-    print(f"Queue total: {total}")
-    print()
+    print(f"Queue total: {total}", flush=True)
+    print(flush=True)
 
     now = datetime.now(timezone.utc)
     utc = timezone.utc
 
-    # Action buckets
-    action_import = []   # items to try force-import
-    action_delete = []   # items to delete-and-research
-    action_skip = []     # low match items for agent oversight
-    action_unknown = []  # items with unrecognized errors
+    action_buckets = {"import": [], "delete": [], "skip": [], "unknown": []}
 
     for record in records:
-        record_id = record.get("id")
-        title = record.get("title", "Unknown")
-        tracked_state = record.get("trackedDownloadState")
-        status_messages = record.get("statusMessages", [])
-        added_str = record.get("added")
-        download_id = record.get("downloadId", "")
-        album_id = record.get("albumId")
-
-        if not status_messages:
+        result = classify_record(record, now, utc)
+        if result is None:
             continue
+        bucket, data = result
+        action_buckets[bucket].append(data)
 
-        sm_str = str(status_messages)
-        flat = flatten_messages(status_messages)
-        primary_reason = flat[0] if flat else ""
-
-        # Stale download check
-        is_stale = False
-        if added_str and tracked_state == "downloading":
-            try:
-                added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
-                is_stale = (now - added_dt) > timedelta(days=14)
-            except:
-                pass
-
-        if tracked_state == "downloading" and is_stale:
-            action_delete.append((record_id, title, "stalled >14d", album_id))
-            continue
-
-        if tracked_state != "importFailed":
-            continue
-
-        # === IMPORT cases (force import, keep files) ===
-        if "Not an upgrade for existing" in sm_str:
-            action_import.append((record_id, download_id, title, "not an upgrade", album_id))
-
-        elif "Album already imported" in sm_str:
-            action_import.append((record_id, download_id, title, "already imported", album_id))
-
-        elif "Failed to import track, Destination already exists" in sm_str:
-            action_import.append((record_id, download_id, title, "dest exists", album_id))
-
-        elif "Has unmatched tracks" in sm_str:
-            action_import.append((record_id, download_id, title, "unmatched tracks", album_id))
-
-        elif ("Album match" in sm_str or "Worst track match" in sm_str) and download_id:
-            match_pct = parse_match_pct(status_messages)
-            if match_pct is not None and match_pct >= 30:
-                action_import.append((record_id, download_id, title, f"match {match_pct}%", album_id))
-            else:
-                action_skip.append((record_id, title, f"match {match_pct}%"))
-
-        # === DELETE cases (remove + re-search) ===
-        elif "Has missing tracks" in sm_str:
-            action_delete.append((record_id, title, "missing tracks", album_id))
-
-        elif "Has fewer tracks than existing release" in sm_str:
-            action_delete.append((record_id, title, "fewer tracks", album_id))
-
-        elif "could not find similar album" in sm_str.lower():
-            action_skip.append((record_id, title, "no matching album (agent needs to match manually)"))
-
-        elif "One or more tracks expected" in sm_str:
-            action_delete.append((record_id, title, "generic import failure", album_id))
-
-        else:
-            action_unknown.append((record_id, title, primary_reason[:100] if primary_reason else "no details"))
+    action_import = action_buckets["import"]
+    action_delete = action_buckets["delete"]
+    action_skip = action_buckets["skip"]
+    action_unknown = action_buckets["unknown"]
 
     # === EXECUTE ===
     results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": []}
@@ -224,15 +275,13 @@ def main():
             if success:
                 results["imported"].append(f"{title[:55]} ({reason})")
             else:
-                # If import fails, fall back to delete + re-search
                 delete_queue_item(rid, remove_from_client=True, album_id=album_id)
                 results["import_failed"].append(f"{title[:55]} ({reason})")
         else:
-            # No downloadId, just delete + re-search
             delete_queue_item(rid, remove_from_client=True, album_id=album_id)
             results["import_failed"].append(f"{title[:55]} (no downloadId)")
 
-    print(f"\nLOW MATCH (agent oversight needed): {len(action_skip)}")
+    print(f"\nLOW MATCH / OVERSIGHT: {len(action_skip)}")
     for rid, title, reason in action_skip[:5]:
         print(f"  ? {title[:55]} — {reason}")
 
@@ -244,7 +293,7 @@ def main():
     print(f"Imported: {len(results['imported'])}")
     if results["import_failed"]:
         print(f"Import failed (deleted instead): {len(results['import_failed'])}")
-    print(f"Skipped (low match %): {len(action_skip)}")
+    print(f"Skipped (oversight): {len(action_skip)}")
     print(f"Unknown/edge cases: {len(action_unknown)}")
 
     if results["imported"]:
@@ -274,15 +323,14 @@ def main():
     print(f"\n{'='*60}")
     print("PHASE 3: Checking for continuously missing albums...")
     print(f"{'='*60}")
-    
-    # Get oldest missing albums (most likely to have name issues)
+
     missing_resp = api_get("wanted/missing", params={
-        "pageSize": 100,
+        "pageSize": cfg["missing_album_scan_count"],
         "page": 1,
         "sortKey": "releaseDate",
         "sortDirection": "ascending",
     })
-    
+
     if "error" not in missing_resp:
         problem_albums = []
         for album in missing_resp.get("records", []):
@@ -290,26 +338,25 @@ def main():
             artist = album.get("artist", {}).get("artistName", "?")
             title = album.get("title", "?")
             album_type = album.get("albumType", "?")
-            
-            # Check search and grab history
-            src = api_get(f"history", params={"pageSize": 1, "albumId": aid, "eventType": 8})
-            grabs = api_get(f"history", params={"pageSize": 1, "albumId": aid, "eventType": 1})
-            
+
+            src = api_get("history", params={"pageSize": 1, "albumId": aid, "eventType": 8})
+            grabs = api_get("history", params={"pageSize": 1, "albumId": aid, "eventType": 1})
+
             s_count = src.get("totalRecords", 0) if isinstance(src, dict) else 0
             g_count = grabs.get("totalRecords", 0) if isinstance(grabs, dict) else 0
-            
-            if s_count >= 2 and g_count == 0:
+
+            if s_count >= cfg["missing_search_threshold"] and g_count == 0:
                 problem_albums.append((aid, artist, title, album_type, s_count))
-        
+
         if problem_albums:
-            print(f"\n  Found {len(problem_albums)} albums searched 2+ times with zero grabs:")
+            print(f"\n  Found {len(problem_albums)} albums searched {cfg['missing_search_threshold']}+ times with zero grabs:")
             for aid, artist, title, atype, s in sorted(problem_albums, key=lambda x: -x[4])[:20]:
                 print(f"  ! [{aid}] {artist} - {title[:55]}")
                 print(f"           Type: {atype} | Searched {s}x | Never grabbed")
-            
+
             if len(problem_albums) > 20:
                 print(f"  ... and {len(problem_albums)-20} more")
-            
+
             print(f"\n[AGENT_OVERSIGHT_NEEDED] {len(problem_albums)} albums may have naming issues")
             for aid, artist, title, atype, s in problem_albums[:10]:
                 print(f"[OVERSIGHT] albumId={aid} | {artist} - {title[:45]} | {s} failed searches")
@@ -319,8 +366,8 @@ def main():
         print(f"  Skipped (could not fetch missing list: {missing_resp.get('error')})")
 
     # Signal edge cases for agent oversight
-    if action_unknown or action_skip:
-        total_oversight = len(action_unknown) + len(action_skip)
+    total_oversight = len(action_unknown) + len(action_skip)
+    if total_oversight:
         print(f"\n[AGENT_OVERSIGHT_NEEDED] {total_oversight} items need review")
         for rid, title, reason in (action_unknown + action_skip)[:10]:
             print(f"[OVERSIGHT] id={rid} | {title[:50]} | {reason[:80]}")
