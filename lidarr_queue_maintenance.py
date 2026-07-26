@@ -19,6 +19,11 @@ CONFIG = {
     "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
 
+    # ── Unmapped Files Cleaner ──
+    # Deletes orphaned track files that aren't linked to any album in Lidarr.
+    "unmapped_files_cleaner_enabled": True,   # set False to skip
+    "unmapped_files_dry_run": False,          # True = report only, don't delete
+
     # ── Per-Download-Client Overrides ──
     # These override the global thresholds for specific download clients.
     # Add entries for any download client name seen in your Lidarr queue.
@@ -165,6 +170,63 @@ def flatten_messages(status_messages):
     for sm in status_messages:
         msgs.extend(sm.get("messages", []))
     return msgs
+
+
+def clean_unmapped_files(cfg):
+    """Find and delete unmapped track files (orphaned files not linked to any album).
+
+    Corresponds to UnmappedFilesCleaner from RandomNinjaAtk/arr-scripts.
+    """
+    dry_run = cfg.get("unmapped_files_dry_run", False)
+    try:
+        unmapped = api_get("trackFile", params={"unmapped": True})
+    except Exception as e:
+        print(f"  Error fetching unmapped files: {e}")
+        return
+
+    if not unmapped or isinstance(unmapped, dict) and unmapped.get("error"):
+        print(f"  Could not fetch unmapped files: {unmapped}")
+        return
+
+    if not isinstance(unmapped, list) or not unmapped:
+        print("  No unmapped files found.")
+        return
+
+    print(f"  Found {len(unmapped)} unmapped file(s).")
+    freed_bytes = 0
+    deleted_count = 0
+
+    for f in unmapped:
+        file_id = f.get("id", "?")
+        path = f.get("path", "")
+        size = f.get("size", 0) or 0
+        dirname = os.path.dirname(path) if path else ""
+
+        print(f"    [{file_id}] {path or '?'[:80]}", end="")
+        if dry_run:
+            print(" (dry run — would delete)")
+            freed_bytes += size
+            deleted_count += 1
+        else:
+            # Delete the Lidarr track file entry
+            try:
+                api_delete(f"trackFile/{file_id}")
+                # Delete the actual file/directory
+                if dirname and os.path.isdir(dirname):
+                    import shutil
+                    shutil.rmtree(dirname, ignore_errors=True)
+                    print(f" → deleted dir + Lidarr entry")
+                else:
+                    print(f" → Lidarr entry removed (dir gone)")
+                freed_bytes += size
+                deleted_count += 1
+            except Exception as e:
+                print(f" → FAILED: {e}")
+
+    print(f"\n  Cleaned: {deleted_count} files"
+          f" ({freed_bytes / (1024**3):.1f} GB freed)"
+          if not dry_run else f"  Would clean: {deleted_count} files"
+          f" ({freed_bytes / (1024**3):.1f} GB)")
 
 
 def get_client_config(download_client):
@@ -421,6 +483,13 @@ def main():
             print("  No continuously missing albums found in this batch.")
     else:
         print(f"  Skipped (could not fetch missing list: {missing_resp.get('error')})")
+
+    # === PHASE 4: Clean up unmapped track files ===
+    if cfg["unmapped_files_cleaner_enabled"]:
+        print(f"\n{'='*60}")
+        print("PHASE 4: Cleaning up unmapped track files...")
+        print(f"{'='*60}")
+        clean_unmapped_files(cfg)
 
     # Signal edge cases for agent oversight
     total_oversight = len(action_unknown) + len(action_skip)
