@@ -11,44 +11,60 @@ from urllib.error import HTTPError
 
 # ── CONFIG ──  Change these to tweak behavior without touching the logic below.
 CONFIG = {
-    # Thresholds
+    # ── Global Thresholds ──
     "match_import_min": 30,          # match % >= this → try force import
     "match_oversight_max": 30,       # match % < this → flag for agent oversight
-    "stale_download_days": 14,       # downloads stuck this many days → delete + re-search
+    "stale_download_days": 14,       # days before a stalled download is deleted + re-searched
     "queue_page_size": 500,          # how many queue records to fetch at once
     "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
 
-    # Action: FORCE IMPORT — items where the files probably exist and just need a nudge.
+    # ── Per-Download-Client Overrides ──
+    # These override the global thresholds for specific download clients.
+    # Add entries for any download client name seen in your Lidarr queue.
+    # Possible clients: Slskd2 (Soulseek), Youtube, Lucida, qBittorrent, etc.
+    "client_overrides": {
+        "Slskd2": {
+            "stale_download_days": 14,      # Slskd retrying — peer may be offline for days
+            "match_import_min": 20,          # Lower match threshold for Soulseek downloads
+            "retrying_message": "Some files failed. Retrying download",  # Slskd retry pattern
+            "retrying_delete_days": 14,      # Delete if retrying for this many days
+        },
+        "Youtube": {
+            "stale_download_days": 3,        # YouTube downloads should finish quickly
+            "match_import_min": 15,          # Lower quality expected from YT audio extraction
+        },
+        "Lucida": {
+            "stale_download_days": 7,
+            "match_import_min": 20,
+        },
+    },
+
+    # ── Action Lists ──
     # Move a keyword between lists to change its action.
+    # Priority order: import > import_if_match > delete > oversight
+
     "import_keywords": [
         "Not an upgrade for existing",           # UpgradeSpecification — quality not better, but files are valid
         "Album already imported",                # AlreadyImportedSpecification — was imported, just stuck in queue
-        "Failed to import track, Destination already exists",  # File system level — dest file exists, just clean up queue
-        "Has unmatched tracks",                  # NoMissingOrUnmatchedTracksSpecification — extra files, import anyway
+        "Failed to import track, Destination already exists",  # File system — dest file exists, clean up queue
+        "Has unmatched tracks",                  # NoMissingOrUnmatchedTracksSpecification — extra files, valid bonus content
         "could not find similar album",          # Folder/name mismatch, agent should match manually → import
     ],
 
-    # Action: IMPORT IF MATCH % >= threshold
     "import_if_match_keywords": [
-        "Album match",                           # CloseAlbumMatchSpecification — "Album match is not close enough: X% vs Y%"
-        "Worst track match",                     # CloseAlbumMatchSpecification — "Worst track match: X% vs Y%"
-        "Track match is not close enough",        # CloseTrackMatchSpecification — individual track match too low
+        "Album match",                           # CloseAlbumMatchSpecification
+        "Worst track match",                     # CloseAlbumMatchSpecification
+        "Track match is not close enough",        # CloseTrackMatchSpecification
     ],
 
-    # Action: DELETE + RE-SEARCH — items where the download was genuinely bad/wrong
     "delete_keywords": [
-        "Has missing tracks",                    # NoMissingOrUnmatchedTracksSpecification — MusicBrainz has tracks missing from this release
-        "Has fewer tracks than existing release", # MoreTracksSpecification — has fewer tracks than what's already on disk
-        "One or more tracks expected",           # Generic wrapper message (no specific reason beneath)
+        "Has missing tracks",                    # NoMissingOrUnmatchedTracksSpecification
+        "Has fewer tracks than existing release", # MoreTracksSpecification
+        "One or more tracks expected",           # Generic wrapper (no specific reason underneath)
     ],
 
-    # Action: SKIP / FLAG FOR AGENT OVERSIGHT — needs human/AI judgement
-    # These are moved here when a pattern needs manual review
-    "oversight_keywords": [
-        # "could not find similar album",  — now handled by import_keywords above
-        # Add patterns here to flag them for agent review
-    ],
+    "oversight_keywords": [],
 }
 # ── END CONFIG ──
 
@@ -151,6 +167,18 @@ def flatten_messages(status_messages):
     return msgs
 
 
+def get_client_config(download_client):
+    """Get effective config for a download client (global defaults + client overrides)."""
+    cfg = {}
+    glob = CONFIG
+    overrides = glob.get("client_overrides", {}).get(download_client, {})
+    cfg["stale_download_days"] = overrides.get("stale_download_days", glob["stale_download_days"])
+    cfg["match_import_min"] = overrides.get("match_import_min", glob["match_import_min"])
+    cfg["retrying_message"] = overrides.get("retrying_message", None)
+    cfg["retrying_delete_days"] = overrides.get("retrying_delete_days", glob["stale_download_days"])
+    return cfg
+
+
 def classify_record(record, now, utc):
     """
     Classify a single queue record into an action bucket.
@@ -163,8 +191,22 @@ def classify_record(record, now, utc):
     added_str = record.get("added")
     download_id = record.get("downloadId", "")
     album_id = record.get("albumId")
+    download_client = record.get("downloadClient", "")
+
+    # Per-client config
+    cc = get_client_config(download_client)
 
     if not status_messages:
+        # Even without status messages, check for retrying
+        error_msg = record.get("errorMessage", "")
+        if cc["retrying_message"] and cc["retrying_message"] in error_msg and added_str:
+            try:
+                added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+                if (now - added_dt) > timedelta(days=cc["retrying_delete_days"]):
+                    return ("delete", (record_id, title,
+                        f"retrying >{cc['retrying_delete_days']}d ({download_client})", album_id))
+            except:
+                pass
         return None
 
     sm_str = str(status_messages)
@@ -172,17 +214,29 @@ def classify_record(record, now, utc):
     flat = flatten_messages(status_messages)
     primary_reason = flat[0] if flat else ""
 
-    # Stale download check
+    # Stale download check (uses per-client stale_download_days)
     is_stale = False
+    retrying = False
     if added_str and tracked_state == "downloading":
         try:
             added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
-            is_stale = (now - added_dt) > timedelta(days=CONFIG["stale_download_days"])
+            is_stale = (now - added_dt) > timedelta(days=cc["stale_download_days"])
         except:
             pass
 
-    if tracked_state == "downloading" and is_stale:
-        return ("delete", (record_id, title, f"stalled >{CONFIG['stale_download_days']}d", album_id))
+    # Check for retrying pattern (e.g. Slskd "Some files failed. Retrying download...")
+    error_msg = record.get("errorMessage", "")
+    if cc["retrying_message"] and cc["retrying_message"] in error_msg and added_str:
+        try:
+            added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+            retrying = (now - added_dt) > timedelta(days=cc["retrying_delete_days"])
+        except:
+            pass
+
+    if tracked_state == "downloading" and (is_stale or retrying):
+        reason = f"stalled >{cc['stale_download_days']}d" if is_stale else f"retrying >{cc['retrying_delete_days']}d"
+        client_tag = f" ({download_client})" if download_client else ""
+        return ("delete", (record_id, title, f"{reason}{client_tag}", album_id))
 
     if tracked_state != "importFailed":
         return None
@@ -197,11 +251,11 @@ def classify_record(record, now, utc):
         if kw in sm_str:
             return ("import", (record_id, download_id, title, kw, album_id))
 
-    # Check import-if-match keywords
+    # Check import-if-match keywords (uses per-client match_import_min)
     for kw in CONFIG["import_if_match_keywords"]:
         if kw in sm_str and download_id:
             match_pct = parse_match_pct(status_messages)
-            if match_pct is not None and match_pct >= CONFIG["match_import_min"]:
+            if match_pct is not None and match_pct >= cc["match_import_min"]:
                 return ("import", (record_id, download_id, title, f"match {match_pct}%", album_id))
             else:
                 return ("skip", (record_id, title, f"match {match_pct}%"))
@@ -222,6 +276,9 @@ def main():
     print(f"Config: match_import_min={cfg['match_import_min']}%"
           f" | stale_days={cfg['stale_download_days']}"
           f" | missing_scan={cfg['missing_album_scan_count']}", flush=True)
+    if cfg["client_overrides"]:
+        clients = ", ".join(cfg["client_overrides"].keys())
+        print(f"Clients with overrides: {clients}", flush=True)
     print(flush=True)
 
     resp = api_get("queue", params={
