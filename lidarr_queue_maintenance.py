@@ -15,7 +15,7 @@ CONFIG = {
     "match_import_min": 30,          # match % >= this → try force import
     "match_oversight_max": 30,       # match % < this → flag for agent oversight
     "stale_download_days": 14,       # days before a stalled download is deleted + re-searched
-    "queue_page_size": 100,          # how many queue records to fetch at once
+    "queue_page_size": 2500,         # how many queue records to fetch at once
     "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
 
