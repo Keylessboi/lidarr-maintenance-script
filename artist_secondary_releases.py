@@ -112,6 +112,7 @@ def process_artist(mbid: str, name: str, root: str, qp: int,
 
     added = 0
     skipped = 0
+    exists = 0
     for r in secondary:
         rid = r["id"]
         try:
@@ -125,26 +126,28 @@ def process_artist(mbid: str, name: str, root: str, qp: int,
             payload = {
                 "foreignAlbumId": rid,
                 "title": album.get("title", r.get("title", "?")),
-                "monitored": False,  # add unmonitored by default
+                "monitored": False,
                 "anyReleaseOk": True,
                 "profileId": qp,
                 "artist": artist,
                 "addOptions": {"searchForNewAlbum": False},
             }
-            ok = requests.post(
+            resp = requests.post(
                 f"{BASE_URL}/api/v1/album",
                 headers={"X-Api-Key": API_KEY, "Content-Type": "application/json"},
                 json=payload, timeout=30
-            ).ok
-            if ok:
+            )
+            if resp.ok:
                 added += 1
+            elif resp.status_code == 400:
+                exists += 1  # Already in Lidarr
             else:
                 skipped += 1
         except Exception:
             skipped += 1
 
-    print(f" → +{added} added, {skipped} skipped")
-    return {"added": added, "skipped": skipped, "total": len(releases)}
+    print(f" → +{added} added, {exists} already exist, {skipped} skipped")
+    return {"added": added, "skipped": skipped, "exists": exists, "total": len(releases)}
 
 
 def main():
@@ -218,7 +221,7 @@ def main():
     print(f"  Due to MusicBrainz API rate limiting (~{MB_SLEEP}s between calls)")
     print()
 
-    totals = {"added": 0, "skipped": 0}
+    totals = {"added": 0, "skipped": 0, "exists": 0}
     for i, artist in enumerate(artists, 1):
         mbid = artist.get("foreignArtistId")
         name = artist.get("artistName", "?")
@@ -232,14 +235,17 @@ def main():
         )
         totals["added"] += result["added"]
         totals["skipped"] += result["skipped"]
+        totals["exists"] += result.get("exists", 0)
         time.sleep(MB_SLEEP)
 
     print("\n" + "=" * 50)
     print("SUMMARY")
     print("=" * 50)
     print(f"  Artists processed: {len(artists)}")
-    print(f"  Secondary releases found: {totals['added'] + totals['skipped']}")
+    print(f"  Secondary releases found: {totals['added'] + totals['exists'] + totals['skipped']}")
     print(f"  Added: {totals['added']}")
+    print(f"  Already in library: {totals['exists']}")
+    print(f"  Failed: {totals['skipped']}")
     if args.dry_run:
         print(f"  (dry run — nothing was actually added)")
     print(f"\n  Note: Secondary releases were added UNMONITORED.")
