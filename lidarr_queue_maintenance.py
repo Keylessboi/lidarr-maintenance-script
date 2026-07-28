@@ -15,7 +15,7 @@ CONFIG = {
     "match_import_min": 30,          # match % >= this → try force import
     "match_oversight_max": 30,       # match % < this → flag for agent oversight
     "stale_download_days": 14,       # days before a stalled download is deleted + re-searched
-    "queue_page_size": 500,          # how many queue records to fetch at once
+    "queue_page_size": 100,          # how many queue records to fetch at once
     "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
 
@@ -380,14 +380,14 @@ def main():
     # === EXECUTE ===
     results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": []}
 
-    print(f"PHASE 1: Deleting {len(action_delete)} items...")
+    print(f"PHASE 1: Deleting {len(action_delete)} items...", flush=True)
     for i, (rid, title, reason, album_id) in enumerate(action_delete, 1):
         delete_queue_item(rid, remove_from_client=True, album_id=album_id)
         results["deleted"].append(title[:60])
-        if i % 100 == 0:
-            print(f"  {i}/{len(action_delete)} deleted...")
+        if i % 50 == 0:
+            print(f"  {i}/{len(action_delete)} deleted...", flush=True)
 
-    print(f"\nPHASE 2: Importing {len(action_import)} items...")
+    print(f"\nPHASE 2: Importing {len(action_import)} items...", flush=True)
     for rid, did, title, reason, album_id in action_import:
         if did:
             success = try_manual_import(did)
