@@ -15,6 +15,9 @@ cd lidarr-maintenance-script
 # Syntax check
 python3 -m py_compile lidarr_queue_maintenance.py
 
+# Classification + pagination tests (no API, no network, no mutations)
+python3 tests/test_classification.py
+
 # Run against your Lidarr instance
 export LIDARR_URL="http://your-lidarr:8686"
 export LIDARR_API_KEY="your-api-key"

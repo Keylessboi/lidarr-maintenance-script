@@ -36,5 +36,7 @@ jobs:
               ast.parse(f.read())
           print('✓ Syntax OK')
           "
+      - name: Classification and pagination tests (no API)
+        run: python3 tests/test_classification.py
       - name: Validate README
         run: test -f README.md && echo "✓ README exists"

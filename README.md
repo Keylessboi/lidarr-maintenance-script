@@ -41,7 +41,8 @@ Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cr
 | **Force import** | Albums that failed auto-import but should still work — re-attempts via Lidarr's manual import API with `move` mode |
 | **Delete + re-search** | Genuinely broken downloads are removed from queue and Lidarr re-searches for a better copy |
 | **Agent oversight** | Ambiguous or low-confidence items get flagged with `[AGENT_OVERSIGHT_NEEDED]` for human/AI review |
-| **Stalled download cleanup** | qBittorrent/Soulseek/YouTube downloads stuck for N+ days are removed and re-searched |
+| **Stalled download cleanup** | qBittorrent/Soulseek/YouTube downloads stuck for N+ days are removed and re-searched. A download the client reports as merely `queued` is left alone — it is waiting for a download slot, not broken |
+| **Whole-queue scan** | Every queue page is fetched, so classification is never limited to a prefix of the queue |
 | **Missing album scan** | Scans the oldest N missing albums for ones that have been repeatedly searched but never grabbed (likely naming/indexer issues) |
 | **Unmapped files cleanup** | Deletes orphaned track files that are no longer linked to any album in Lidarr |
 | **Tubifarry integration** | Per-download-client config for Slskd2/Soulseek, YouTube, Lucida — handles retrying downloads, lower match thresholds, stale timeout overrides |
@@ -149,8 +150,10 @@ CONFIG = {
 |---------|---------|-------------|
 | `match_import_min` | `30` | Minimum match percentage (0-100). Items with Album match / Worst track match >= this value get force-imported. Below this → flagged for oversight. |
 | `match_oversight_max` | `30` | Matches `match_import_min` by default. Items below this go to the oversight bucket. |
-| `stale_download_days` | `14` | Days a download can sit in "downloading" state before it's considered stalled and gets deleted + re-searched. |
-| `queue_page_size` | `500` | How many queue records to fetch from Lidarr per API call. Lower = smaller JSON payloads. Higher = fewer pages to fetch. |
+| `stale_download_days` | `14` | Days a download can sit unfinished before it is considered stalled and gets deleted + re-searched. Age alone is not enough: the record must also have import-failure messages, or a client status that means it is not progressing (`downloading` or `paused`). A record the client reports as `queued` is waiting for a download slot — a backlog, not a fault — and is never treated as stale. |
+| `queue_page_size` | `500` | Records per queue PAGE. The queue is paginated until every record has been fetched, so this is not a ceiling on how much of the queue is seen. Lower = smaller JSON payloads; higher = fewer requests (Lidarr takes ~46s to serve 1,000 records). |
+| `max_deletes_per_run` | `50` | Cap on delete + re-search actions per run. Every delete fires an `AlbumSearch`, so this bounds how much search load one run can create. Leftovers are picked up by the next run, oldest first. |
+| `max_imports_per_run` | `500` | Cap on force-import attempts per run, keeping runtime and Lidarr load predictable. |
 | `missing_album_scan_count` | `10` | How many of the oldest missing albums to check per run. Kept low to avoid API rate issues. |
 | `missing_search_threshold` | `2` | If a missing album has been searched this many times with zero successful grabs, flag it as a potential naming issue. |
 

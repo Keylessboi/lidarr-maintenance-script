@@ -15,9 +15,23 @@ CONFIG = {
     "match_import_min": 30,          # match % >= this → try force import
     "match_oversight_max": 30,       # match % < this → flag for agent oversight
     "stale_download_days": 14,       # days before a stalled download is deleted + re-searched
-    "queue_page_size": 2500,         # how many queue records to fetch at once
+    # Records per queue PAGE. The queue is paginated - see fetch_queue() - so
+    # this is a page size and not a ceiling on how much of the queue is seen.
+    # Kept at 500 because Lidarr serialises the whole queue to answer one
+    # request (~46s per 1,000 records on a 2,500-record queue).
+    "queue_page_size": 500,
     "missing_album_scan_count": 10,  # how many oldest missing albums to check (kept low to avoid timeouts)
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
+
+    # ── Per-run action caps ──
+    # Every delete fires an AlbumSearch, and Lidarr's command queue is what a
+    # mass search wedges (docs/doctor-log.md, 2026-09-17: 216 commands stuck in
+    # "started", ProcessMonitoredDownloads wedged 13.5 hours). While this script
+    # only ever saw its first 500 records, the number of matching records was
+    # accidentally bounded by that window. It now sees the whole queue, so bound
+    # it deliberately instead. Leftovers are next run's work, oldest first.
+    "max_deletes_per_run": 50,
+    "max_imports_per_run": 500,
 
     # ── Unmapped Files Cleaner ──
     # Deletes orphaned track files that aren't linked to any album in Lidarr.
@@ -73,6 +87,13 @@ CONFIG = {
 }
 # ── END CONFIG ──
 
+# Client statuses that mean a download is NOT progressing, and so may be
+# treated as stale. Lidarr reports trackedDownloadState "downloading" for
+# anything the client has not finished, which includes a torrent merely queued
+# behind a download-slot limit - that is a backlog, not a fault. See
+# classify_record().
+STALE_CLIENT_STATUSES = ("downloading", "paused")
+
 
 API_KEY = os.environ.get("LIDARR_API_KEY", "")
 BASE_URL = os.environ.get("LIDARR_URL", "")
@@ -93,14 +114,21 @@ HEADERS = {
 }
 
 
-def api_get(path, params=None):
+# A queue page is served by serialising the entire queue, which is slow: one
+# pageSize=1000 request against a 2,500-record queue measured ~46s on this
+# library. 30s was therefore not a timeout but a guaranteed failure - it is why
+# the nightly run died on "ERROR fetching queue: timed out" for weeks.
+API_TIMEOUT = 300
+
+
+def api_get(path, params=None, timeout=API_TIMEOUT):
     url = f"{BASE_URL}/api/v1/{path}"
     if params:
         qs = "&".join(f"{k}={v}" for k, v in params.items())
         url = f"{url}?{qs}"
     req = Request(url, headers=HEADERS, method="GET")
     try:
-        with urlopen(req, timeout=30) as resp:
+        with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as e:
         return {"error": str(e), "status": e.code}
@@ -113,7 +141,7 @@ def api_post(path, data):
     body = json.dumps(data).encode()
     req = Request(url, data=body, headers=HEADERS, method="POST")
     try:
-        with urlopen(req, timeout=30) as resp:
+        with urlopen(req, timeout=API_TIMEOUT) as resp:
             return resp.read().decode()
     except HTTPError as e:
         return f"HTTP {e.code}: {e.read().decode()[:200]}"
@@ -125,7 +153,7 @@ def api_delete(path):
     url = f"{BASE_URL}/api/v1/{path}"
     req = Request(url, headers=HEADERS, method="DELETE")
     try:
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=120) as resp:
             return resp.read().decode()
     except HTTPError as e:
         return f"HTTP {e.code}"
@@ -258,36 +286,39 @@ def classify_record(record, now, utc):
     # Per-client config
     cc = get_client_config(download_client)
 
-    if not status_messages:
-        # Even without status messages, check for retrying
-        error_msg = record.get("errorMessage", "")
-        if cc["retrying_message"] and cc["retrying_message"] in error_msg and added_str:
-            try:
-                added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
-                if (now - added_dt) > timedelta(days=cc["retrying_delete_days"]):
-                    return ("delete", (record_id, title,
-                        f"retrying >{cc['retrying_delete_days']}d ({download_client})", album_id))
-            except:
-                pass
-        return None
-
-    sm_str = str(status_messages)
-    sm_lower = sm_str.lower()
-    flat = flatten_messages(status_messages)
-    primary_reason = flat[0] if flat else ""
-
-    # Stale download check (uses per-client stale_download_days)
+    # ── Stale / retrying checks ──
+    #
+    # THESE COME FIRST, AND THAT ORDER IS THE FIX.
+    #
+    # They used to sit BELOW an early `if not status_messages: return None`, so
+    # they could only fire on a record that ALSO carried import-failure
+    # messages - never on a stalled download, which is the one case they exist
+    # for. Lidarr emits no status messages at all for a download that is merely
+    # in progress or waiting for a download slot, and that is most of a queue
+    # this size.
+    #
+    # Being stale is deliberately NOT age alone. Lidarr reports
+    # trackedDownloadState "downloading" for anything the client has not
+    # finished, which includes a torrent simply QUEUED behind the slot limit -
+    # the normal state of a backlog, not a fault. Treating those as stale would
+    # discard working grabs and fire a re-search for every one of them
+    # (measured 2026-09-21: 1,289 records, against 40 genuinely stalled).
+    # So a record with no status messages must have a client status that says
+    # the download is not progressing; see STALE_CLIENT_STATUSES.
+    client_status = record.get("status", "")
+    error_msg = record.get("errorMessage", "")
     is_stale = False
     retrying = False
+
     if added_str and tracked_state == "downloading":
-        try:
-            added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
-            is_stale = (now - added_dt) > timedelta(days=cc["stale_download_days"])
-        except:
-            pass
+        if status_messages or client_status in STALE_CLIENT_STATUSES:
+            try:
+                added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+                is_stale = (now - added_dt) > timedelta(days=cc["stale_download_days"])
+            except:
+                pass
 
     # Check for retrying pattern (e.g. Slskd "Some files failed. Retrying download...")
-    error_msg = record.get("errorMessage", "")
     if cc["retrying_message"] and cc["retrying_message"] in error_msg and added_str:
         try:
             added_dt = datetime.strptime(str(added_str), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
@@ -299,6 +330,14 @@ def classify_record(record, now, utc):
         reason = f"stalled >{cc['stale_download_days']}d" if is_stale else f"retrying >{cc['retrying_delete_days']}d"
         client_tag = f" ({download_client})" if download_client else ""
         return ("delete", (record_id, title, f"{reason}{client_tag}", album_id))
+
+    if not status_messages:
+        return None
+
+    sm_str = str(status_messages)
+    sm_lower = sm_str.lower()
+    flat = flatten_messages(status_messages)
+    primary_reason = flat[0] if flat else ""
 
     if tracked_state != "importFailed":
         return None
@@ -331,6 +370,43 @@ def classify_record(record, now, utc):
     return ("unknown", (record_id, title, primary_reason[:100] if primary_reason else "no details"))
 
 
+def fetch_queue(cfg):
+    """Fetch the WHOLE queue, one page at a time.
+
+    A single request returns at most pageSize records and says nothing about
+    the rest, so the caller silently works on a PREFIX of the queue. With
+    sortKey=status that prefix was always the same alphabetical block
+    ('completed' first), which is how this script spent weeks examining 500 of
+    2,587 records and never once looking at the other 2,000 - including every
+    stalled download it exists to clear.
+
+    Returns (records, error). No sortKey is sent: pages are fetched in the
+    server's own stable order and the caller sorts once it has everything, so
+    the per-run caps apply to the oldest work rather than to whichever page
+    happened to come back first.
+    """
+    records = []
+    page = 1
+    total = 0
+    while True:
+        resp = api_get("queue", params={
+            "page": page,
+            "pageSize": cfg["queue_page_size"],
+            "includeUnknownArtistItems": True,
+        })
+        if "error" in resp:
+            return None, resp["error"]
+        batch = resp.get("records", []) or []
+        total = resp.get("totalRecords", 0)
+        records.extend(batch)
+        if not batch or len(records) >= total:
+            break
+        page += 1
+        if page > 40:  # hard stop: 40 x pageSize records, no infinite loop
+            break
+    return records, None
+
+
 def main():
     cfg = CONFIG
     print(f"Lidarr Queue Maintenance — {datetime.now().isoformat()}", flush=True)
@@ -343,21 +419,17 @@ def main():
         print(f"Clients with overrides: {clients}", flush=True)
     print(flush=True)
 
-    resp = api_get("queue", params={
-        "pageSize": cfg["queue_page_size"],
-        "page": 1,
-        "sortDirection": "ascending",
-        "sortKey": "status",
-        "includeUnknownArtistItems": True,
-    })
-
-    if "error" in resp:
-        print(f"ERROR fetching queue: {resp['error']}", flush=True)
+    records, err = fetch_queue(cfg)
+    if err:
+        print(f"ERROR fetching queue: {err}", flush=True)
         sys.exit(1)
 
-    records = resp.get("records", [])
-    total = resp.get("totalRecords", 0)
-    print(f"Queue total: {total}", flush=True)
+    total = len(records)
+    print(f"Queue total: {total} records fetched (all pages)", flush=True)
+
+    # Oldest first, so the caps below spend themselves on the work that has been
+    # waiting longest. ISO-8601 strings sort correctly as text.
+    records.sort(key=lambda r: str(r.get("added") or ""))
     print(flush=True)
 
     now = datetime.now(timezone.utc)
@@ -376,6 +448,20 @@ def main():
     action_delete = action_buckets["delete"]
     action_skip = action_buckets["skip"]
     action_unknown = action_buckets["unknown"]
+
+    # Caps are applied AFTER classification, so the summary still reports how
+    # much was matched and the log shows what was deferred. Whatever is left is
+    # simply next run's work.
+    deferred_delete = max(0, len(action_delete) - cfg["max_deletes_per_run"])
+    deferred_import = max(0, len(action_import) - cfg["max_imports_per_run"])
+    action_delete = action_delete[:cfg["max_deletes_per_run"]]
+    action_import = action_import[:cfg["max_imports_per_run"]]
+    if deferred_delete:
+        print(f"NOTE: {deferred_delete} further delete(s) deferred to the next run "
+              f"(max_deletes_per_run={cfg['max_deletes_per_run']})", flush=True)
+    if deferred_import:
+        print(f"NOTE: {deferred_import} further import(s) deferred to the next run "
+              f"(max_imports_per_run={cfg['max_imports_per_run']})", flush=True)
 
     # === EXECUTE ===
     results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": []}
@@ -436,7 +522,8 @@ def main():
             print(f"  ? [{rid}] {title[:55]}")
             print(f"    Reason: {reason[:100]}")
 
-    print(f"\nDone. Queue now has {total - len(action_delete)} items.")
+    print(f"\nDone. {len(action_delete)} record(s) deleted and "
+          f"{len(action_import)} imported out of a {total}-record queue.")
 
     # === PHASE 3: Find continuously missing albums ===
     print(f"\n{'='*60}")
