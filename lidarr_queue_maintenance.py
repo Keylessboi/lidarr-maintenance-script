@@ -522,8 +522,12 @@ def main():
             print(f"  ? [{rid}] {title[:55]}")
             print(f"    Reason: {reason[:100]}")
 
-    print(f"\nDone. {len(action_delete)} record(s) deleted and "
-          f"{len(action_import)} imported out of a {total}-record queue.")
+    # Count what actually happened, not what was attempted: action_import is
+    # the capped work list, and an entry in it can still fail and be deleted
+    # instead. A live run on 2026-09-21 reported "500 imported" while the
+    # summary above it correctly said 499 imported and 1 deleted.
+    print(f"\nDone. {len(results['deleted'])} deleted and {len(results['imported'])} imported "
+          f"out of a {total}-record queue.")
 
     # === PHASE 3: Find continuously missing albums ===
     print(f"\n{'='*60}")
