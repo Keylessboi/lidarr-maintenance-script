@@ -243,9 +243,9 @@ def clean_unmapped_files(cfg):
                 if dirname and os.path.isdir(dirname):
                     import shutil
                     shutil.rmtree(dirname, ignore_errors=True)
-                    print(f" → deleted dir + Lidarr entry")
+                    print(" → deleted dir + Lidarr entry")
                 else:
-                    print(f" → Lidarr entry removed (dir gone)")
+                    print(" → Lidarr entry removed (dir gone)")
                 freed_bytes += size
                 deleted_count += 1
             except Exception as e:
@@ -502,22 +502,22 @@ def main():
     print(f"Unknown/edge cases: {len(action_unknown)}")
 
     if results["imported"]:
-        print(f"\n--- Imported ---")
+        print("\n--- Imported ---")
         for item in results["imported"][:15]:
             print(f"  + {item}")
 
     if results["import_failed"]:
-        print(f"\n--- Import Failed (deleted) ---")
+        print("\n--- Import Failed (deleted) ---")
         for item in results["import_failed"][:10]:
             print(f"  ~ {item}")
 
     if results["deleted"]:
-        print(f"\n--- Deleted ---")
+        print("\n--- Deleted ---")
         for item in results["deleted"][:10]:
             print(f"  - {item}")
 
     if action_unknown:
-        print(f"\n--- UNKNOWN — Agent Review Needed ---")
+        print("\n--- UNKNOWN — Agent Review Needed ---")
         for rid, title, reason in action_unknown[:15]:
             print(f"  ? [{rid}] {title[:55]}")
             print(f"    Reason: {reason[:100]}")
