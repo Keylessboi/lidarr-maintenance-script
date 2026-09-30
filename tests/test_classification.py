@@ -85,6 +85,86 @@ def test_import_and_keywords():
     check("importFailed + import keyword", usable, "import")
 
 
+MULTI = ("Unable to import automatically, found multiple artists: "
+         "[7138333@deezer][Chris Travis], [ba7c9491-4fac-440f-8684-ae6afb4f20a9][Chris Travis]")
+
+
+def test_multiple_artists():
+    # Real shape from the live queue (2026-09-30): a finished Slskd download
+    # parked as "downloading" with a warning, no albumId and no added date.
+    rec = record(trackedDownloadState="downloading", status="completed", albumId=None,
+                 added=None, downloadClient="Slskd2",
+                 statusMessages=[{"title": "Chris Travis - 9k Freestyle", "messages": [MULTI]}])
+    check("multiple artists, finished download", rec, "resolve_artist")
+    # Must win over the stale rule: deleting it would discard a good download
+    # and, with no albumId, re-search nothing.
+    old = dict(rec, added=(NOW - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    check("multiple artists beats stale", old, "resolve_artist")
+    got = lq.parse_multiple_artists([MULTI])
+    want = [("7138333@deezer", "Chris Travis"),
+            ("ba7c9491-4fac-440f-8684-ae6afb4f20a9", "Chris Travis")]
+    if got != want:
+        FAILURES.append("parse_multiple_artists: %r" % (got,))
+        print("  FAIL parse_multiple_artists: %r" % (got,))
+    else:
+        print("  ok   %-44s -> 2 candidates" % "parse_multiple_artists")
+
+
+def _item(artist_id, album_id, rejections=()):
+    return {"path": "/data/x/%d.flac" % artist_id, "artist": {"id": artist_id},
+            "album": {"id": album_id}, "albumReleaseId": album_id * 10,
+            "tracks": [{"id": album_id * 100}], "downloadId": "abc",
+            "rejections": [{"reason": r} for r in rejections]}
+
+
+def _resolve(responses, artists):
+    real = lq.api_get
+    lq.api_get = lambda path, params=None, timeout=None: responses[params["artistId"]]
+    try:
+        cands = [(a["foreignArtistId"], "X") for a in artists]
+        by_fid = {a["foreignArtistId"]: a for a in artists}
+        return lq.resolve_multiple_artists("abc", cands, by_fid, lq.get_client_config("Slskd2"))
+    finally:
+        lq.api_get = real
+
+
+def _expect(name, got, want_artist):
+    files, artist, why = got
+    got_id = artist["id"] if artist else None
+    if got_id != want_artist:
+        FAILURES.append("%s: expected artist %r, got %r (%s)" % (name, want_artist, got_id, why))
+        print("  FAIL %s: expected artist %r, got %r (%s)" % (name, want_artist, got_id, why))
+    else:
+        print("  ok   %-44s -> artist %r (%s)" % (name, got_id, why[:30]))
+
+
+def test_resolve_multiple_artists():
+    deezer = {"id": 519, "foreignArtistId": "7138333@deezer", "statistics": {"trackFileCount": 3}}
+    mb = {"id": 946, "foreignArtistId": "ba7c", "statistics": {"trackFileCount": 0}}
+    # Both map cleanly: the artist that already holds files wins.
+    _expect("both clean -> artist with files",
+            _resolve({519: [_item(519, 1)], 946: [_item(946, 2)]}, [deezer, mb]), 519)
+    # Only one maps an album at all.
+    no_album = dict(_item(946, 2), album=None)
+    _expect("only one maps an album",
+            _resolve({519: [no_album], 946: [_item(946, 2)]}, [deezer, mb]), 946)
+    # A clean match beats one that only passes on match % (Target Practice).
+    weak = _item(519, 1, ["Album match is not close enough: 67.9% vs 80% [artist]"])
+    _expect("clean beats above-threshold match",
+            _resolve({519: [weak], 946: [_item(946, 2)]}, [deezer, mb]), 946)
+    # Above the Slskd2 threshold (20%) is still importable when it is all there is.
+    _expect("above threshold when alone",
+            _resolve({519: [weak], 946: []}, [deezer, mb]), 519)
+    # Below the threshold, or a delete keyword: leave it for oversight.
+    low = _item(519, 1, ["Album match is not close enough: 5.0% vs 80% [artist]"])
+    missing = _item(946, 2, ["Has missing tracks"])
+    _expect("nothing acceptable -> unresolved",
+            _resolve({519: [low], 946: [missing]}, [deezer, mb]), None)
+    # Files spread over two albums are ambiguous, not an import.
+    _expect("spans two albums -> unresolved",
+            _resolve({519: [_item(519, 1), _item(519, 3)], 946: []}, [deezer, mb]), None)
+
+
 def test_pagination():
     pages = {
         1: {"records": [{"id": 1}, {"id": 2}], "totalRecords": 5},
@@ -136,7 +216,8 @@ def test_pagination():
 
 if __name__ == "__main__":
     for fn in (test_stale, test_queued_is_not_stale, test_retrying,
-               test_import_and_keywords, test_pagination):
+               test_import_and_keywords, test_multiple_artists,
+               test_resolve_multiple_artists, test_pagination):
         fn()
     if FAILURES:
         print("\n%d failure(s):" % len(FAILURES))

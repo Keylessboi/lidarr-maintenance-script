@@ -4,7 +4,7 @@ Lidarr Queue Maintenance Script
 Runs the heavy lifting (API calls) to save tokens.
 Outputs structured results for agentic oversight on edge cases.
 """
-import json, re, os, sys
+import json, re, os, sys, time
 from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -95,6 +95,10 @@ CONFIG = {
 STALE_CLIENT_STATUSES = ("downloading", "paused")
 
 
+# DRY_RUN=1 classifies and resolves everything but sends no POST or DELETE,
+# so a change can be checked against the live queue before it is trusted.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
 API_KEY = os.environ.get("LIDARR_API_KEY", "")
 BASE_URL = os.environ.get("LIDARR_URL", "")
 if not API_KEY or not BASE_URL:
@@ -137,6 +141,8 @@ def api_get(path, params=None, timeout=API_TIMEOUT):
 
 
 def api_post(path, data):
+    if DRY_RUN:
+        return "DRY_RUN"
     url = f"{BASE_URL}/api/v1/{path}"
     body = json.dumps(data).encode()
     req = Request(url, data=body, headers=HEADERS, method="POST")
@@ -150,6 +156,8 @@ def api_post(path, data):
 
 
 def api_delete(path):
+    if DRY_RUN:
+        return "DRY_RUN"
     url = f"{BASE_URL}/api/v1/{path}"
     req = Request(url, headers=HEADERS, method="DELETE")
     try:
@@ -169,7 +177,15 @@ def delete_queue_item(record_id, remove_from_client=True, album_id=None):
 
 
 def try_manual_import(download_id):
-    """Attempt to force-import via Lidarr manual import API"""
+    """Attempt to force-import via Lidarr manual import API
+
+    KNOWN NO-OP (2026-09-30): POST /manualimport only re-evaluates the items,
+    it does not import them - see run_manual_import(). Every "imported" item a
+    run reports from here is still in the queue the next night. Switching this
+    to run_manual_import() would start real imports for the first time,
+    including "Not an upgrade" ones that replace better files, so it is left
+    for the owner to decide rather than changed in passing.
+    """
     items = api_get(f"manualimport?downloadId={download_id}")
     if not items or isinstance(items, dict) and items.get("error"):
         return False
@@ -179,6 +195,140 @@ def try_manual_import(download_id):
         item["importMode"] = "move"
     api_post("manualimport", items)
     return True
+
+
+# How long to wait for one ManualImport command. Lidarr runs disk-access
+# commands one at a time, and a FLAC album moved onto the NAS takes a while.
+MANUAL_IMPORT_WAIT = 600
+
+# "found multiple artists: [7138333@deezer][Chris Travis], [ba7c...][Chris Travis]"
+MULTIPLE_ARTISTS_RE = re.compile(r"found multiple artists: (.*)")
+ARTIST_TOKEN_RE = re.compile(r"\[([^\]]+)\]\[([^\]]*)\]")
+
+
+def parse_multiple_artists(messages):
+    """Return [(foreignArtistId, name), ...] from a "found multiple artists"
+    warning, or [] when the record does not carry one."""
+    for msg in messages:
+        m = MULTIPLE_ARTISTS_RE.search(msg)
+        if m:
+            return ARTIST_TOKEN_RE.findall(m.group(1))
+    return []
+
+
+def importable_files(items):
+    """ManualImport command entries for the manualimport items Lidarr mapped to
+    an artist, album, release and tracks. Unmapped items (cover art, cue files,
+    bonus tracks) are left out rather than imported blind."""
+    files = []
+    for item in items:
+        artist = item.get("artist") or {}
+        album = item.get("album") or {}
+        track_ids = [t["id"] for t in item.get("tracks") or [] if t.get("id")]
+        if not (artist.get("id") and album.get("id") and item.get("albumReleaseId") and track_ids):
+            continue
+        files.append({
+            "path": item["path"],
+            "artistId": artist["id"],
+            "albumId": album["id"],
+            "albumReleaseId": item["albumReleaseId"],
+            "trackIds": track_ids,
+            "quality": item.get("quality"),
+            "releaseGroup": item.get("releaseGroup"),
+            "indexerFlags": item.get("indexerFlags", 0),
+            "downloadId": item.get("downloadId"),
+            "disableReleaseSwitching": item.get("disableReleaseSwitching", False),
+        })
+    return files
+
+
+def run_manual_import(files):
+    """Import files with Lidarr's ManualImport command and wait for it to end.
+
+    This is the call the Manual Import dialog makes. POST /manualimport is NOT
+    an import: it is UpdateItems, which re-evaluates the items and hands them
+    back (Lidarr.Api.V1/ManualImport/ManualImportController.cs) - which is why
+    try_manual_import() above reports success without importing anything.
+    importMode "auto" moves soulseek/usenet files and copies torrent files, so
+    seeding survives.
+    """
+    if DRY_RUN:
+        return True
+    resp = api_post("command", {
+        "name": "ManualImport",
+        "files": files,
+        "importMode": "auto",
+        "replaceExistingFiles": False,
+    })
+    try:
+        command_id = json.loads(resp).get("id")
+    except (ValueError, AttributeError):
+        return False
+    if not command_id:
+        return False
+    deadline = time.monotonic() + MANUAL_IMPORT_WAIT
+    while time.monotonic() < deadline:
+        status = api_get(f"command/{command_id}").get("status")
+        if status == "completed":
+            return True
+        if status in ("failed", "aborted", "cancelled", "orphaned"):
+            return False
+        time.sleep(2)
+    return False
+
+
+def resolve_multiple_artists(download_id, candidates, artists_by_fid, cc):
+    """Work out which of several same-named library artists a download is for.
+
+    Lidarr will not guess when a release title's artist name matches more than
+    one library artist - typically the same person added twice, once from
+    MusicBrainz and once from another metadata source (7138333@deezer). It
+    leaves the finished download in the queue as "downloading" with a warning,
+    with no albumId, indefinitely.
+
+    Asking manualimport for the download WITH an explicit artistId removes the
+    ambiguity, so ask once per candidate and keep the one whose files map to a
+    single album and pass the same keyword rules as any other failed import.
+    Ties go to a clean match, then more files mapped, then the artist that
+    already holds files, then the one added first.
+
+    Returns (files, artist, reason); files is None when nothing qualified.
+    """
+    best = None
+    tried = []
+    for fid, name in candidates:
+        artist = artists_by_fid.get(fid)
+        if not artist:
+            tried.append(f"{fid} not in library")
+            continue
+        items = api_get("manualimport", params={
+            "downloadId": download_id,
+            "artistId": artist["id"],
+            "filterExistingFiles": True,
+        })
+        if not isinstance(items, list) or not items:
+            tried.append(f"artistId={artist['id']} no files")
+            continue
+        files = importable_files(items)
+        if not files:
+            tried.append(f"artistId={artist['id']} no album match")
+            continue
+        if len({f["albumId"] for f in files}) != 1:
+            tried.append(f"artistId={artist['id']} spans several albums")
+            continue
+        rejections = [r.get("reason", "") for item in items for r in item.get("rejections") or []]
+        verdict, why = judge_messages([{"messages": rejections}], cc)
+        if rejections and verdict != "import":
+            tried.append(f"artistId={artist['id']} {why[:40]}")
+            continue
+        stats = artist.get("statistics") or {}
+        rank = (not rejections, len(files), stats.get("trackFileCount") or 0,
+                stats.get("albumCount") or 0, -artist["id"])
+        if best is None or rank > best[0]:
+            best = (rank, files, artist, "clean match" if not rejections else why)
+    if best is None:
+        return None, None, "; ".join(tried) or "no candidate artist resolved"
+    return best[1], best[2], best[3]
 
 
 def parse_match_pct(status_messages):
@@ -286,6 +436,16 @@ def classify_record(record, now, utc):
     # Per-client config
     cc = get_client_config(download_client)
 
+    # ── Several library artists share this release's artist name ──
+    #
+    # Checked before the stale rules on purpose. Lidarr parks these as
+    # "downloading" with a warning although the client has finished, and they
+    # carry no albumId - so the stale rule would delete a good download and
+    # have nothing to re-search. See resolve_multiple_artists().
+    candidates = parse_multiple_artists(flatten_messages(status_messages))
+    if candidates:
+        return ("resolve_artist", (record_id, download_id, title, candidates, download_client))
+
     # ── Stale / retrying checks ──
     #
     # THESE COME FIRST, AND THAT ORDER IS THE FIX.
@@ -334,40 +494,52 @@ def classify_record(record, now, utc):
     if not status_messages:
         return None
 
+    if tracked_state != "importFailed":
+        return None
+
+    verdict, reason = judge_messages(status_messages, cc, bool(download_id))
+    if verdict == "import":
+        return ("import", (record_id, download_id, title, reason, album_id))
+    if verdict == "delete":
+        return ("delete", (record_id, title, reason, album_id))
+    return (verdict, (record_id, title, reason))
+
+
+def judge_messages(status_messages, cc, has_download_id=True):
+    """Map Lidarr's import-failure messages to (verdict, reason), where verdict
+    is import, skip, delete or unknown. Shared by queue records and by the
+    rejections manualimport returns when a duplicate artist is resolved."""
     sm_str = str(status_messages)
     sm_lower = sm_str.lower()
     flat = flatten_messages(status_messages)
     primary_reason = flat[0] if flat else ""
 
-    if tracked_state != "importFailed":
-        return None
-
     # Check oversight keywords first (they take priority)
     for kw in CONFIG["oversight_keywords"]:
         if kw.lower() in sm_lower:
-            return ("skip", (record_id, title, kw))
+            return ("skip", kw)
 
     # Check import keywords
     for kw in CONFIG["import_keywords"]:
         if kw in sm_str:
-            return ("import", (record_id, download_id, title, kw, album_id))
+            return ("import", kw)
 
     # Check import-if-match keywords (uses per-client match_import_min)
     for kw in CONFIG["import_if_match_keywords"]:
-        if kw in sm_str and download_id:
+        if kw in sm_str and has_download_id:
             match_pct = parse_match_pct(status_messages)
             if match_pct is not None and match_pct >= cc["match_import_min"]:
-                return ("import", (record_id, download_id, title, f"match {match_pct}%", album_id))
+                return ("import", f"match {match_pct}%")
             else:
-                return ("skip", (record_id, title, f"match {match_pct}%"))
+                return ("skip", f"match {match_pct}%")
 
     # Check delete keywords
     for kw in CONFIG["delete_keywords"]:
         if kw in sm_str:
-            return ("delete", (record_id, title, kw, album_id))
+            return ("delete", kw)
 
     # Unknown
-    return ("unknown", (record_id, title, primary_reason[:100] if primary_reason else "no details"))
+    return ("unknown", primary_reason[:100] if primary_reason else "no details")
 
 
 def fetch_queue(cfg):
@@ -411,6 +583,8 @@ def main():
     cfg = CONFIG
     print(f"Lidarr Queue Maintenance — {datetime.now().isoformat()}", flush=True)
     print(f"Target: {BASE_URL}", flush=True)
+    if DRY_RUN:
+        print("DRY RUN: no deletes, imports or searches will be sent", flush=True)
     print(f"Config: match_import_min={cfg['match_import_min']}%"
           f" | stale_days={cfg['stale_download_days']}"
           f" | missing_scan={cfg['missing_album_scan_count']}", flush=True)
@@ -435,7 +609,7 @@ def main():
     now = datetime.now(timezone.utc)
     utc = timezone.utc
 
-    action_buckets = {"import": [], "delete": [], "skip": [], "unknown": []}
+    action_buckets = {"import": [], "delete": [], "skip": [], "unknown": [], "resolve_artist": []}
 
     for record in records:
         result = classify_record(record, now, utc)
@@ -448,6 +622,7 @@ def main():
     action_delete = action_buckets["delete"]
     action_skip = action_buckets["skip"]
     action_unknown = action_buckets["unknown"]
+    action_resolve = action_buckets["resolve_artist"]
 
     # Caps are applied AFTER classification, so the summary still reports how
     # much was matched and the log shows what was deferred. Whatever is left is
@@ -456,15 +631,21 @@ def main():
     deferred_import = max(0, len(action_import) - cfg["max_imports_per_run"])
     action_delete = action_delete[:cfg["max_deletes_per_run"]]
     action_import = action_import[:cfg["max_imports_per_run"]]
+    deferred_resolve = max(0, len(action_resolve) - cfg["max_imports_per_run"])
+    action_resolve = action_resolve[:cfg["max_imports_per_run"]]
     if deferred_delete:
         print(f"NOTE: {deferred_delete} further delete(s) deferred to the next run "
               f"(max_deletes_per_run={cfg['max_deletes_per_run']})", flush=True)
     if deferred_import:
         print(f"NOTE: {deferred_import} further import(s) deferred to the next run "
               f"(max_imports_per_run={cfg['max_imports_per_run']})", flush=True)
+    if deferred_resolve:
+        print(f"NOTE: {deferred_resolve} further multiple-artist item(s) deferred to the next run "
+              f"(max_imports_per_run={cfg['max_imports_per_run']})", flush=True)
 
     # === EXECUTE ===
-    results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": []}
+    results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": [],
+               "artist_resolved": [], "artist_unresolved": []}
 
     print(f"PHASE 1: Deleting {len(action_delete)} items...", flush=True)
     for i, (rid, title, reason, album_id) in enumerate(action_delete, 1):
@@ -486,6 +667,37 @@ def main():
             delete_queue_item(rid, remove_from_client=True, album_id=album_id)
             results["import_failed"].append(f"{title[:55]} (no downloadId)")
 
+    # Resolving each download is the workaround; merging the duplicate artists
+    # in Lidarr is the fix, and that is not a call for a script to make. Count
+    # the queue items per duplicate set so the oversight report can say so.
+    duplicate_artists = {}
+    print(f"\nPHASE 2b: Resolving {len(action_resolve)} multiple-artist items...", flush=True)
+    if action_resolve:
+        library = api_get("artist")
+        artists_by_fid = ({a.get("foreignArtistId"): a for a in library}
+                          if isinstance(library, list) else {})
+        if not artists_by_fid:
+            print(f"  Could not fetch the artist list: {library}", flush=True)
+        for rid, did, title, candidates, client in action_resolve:
+            key = tuple(sorted(candidates))
+            duplicate_artists[key] = duplicate_artists.get(key, 0) + 1
+            if not artists_by_fid:
+                continue
+            if not did:
+                action_skip.append((rid, title, "multiple artists, no downloadId"))
+                continue
+            files, artist, why = resolve_multiple_artists(
+                did, candidates, artists_by_fid, get_client_config(client))
+            if files and run_manual_import(files):
+                results["artist_resolved"].append(
+                    f"{title[:45]} -> {artist.get('artistName')} [{artist.get('foreignArtistId')}] ({why})")
+                continue
+            reason = f"ManualImport failed ({why})" if files else why
+            results["artist_unresolved"].append(f"[{rid}] {title[:45]} | {reason[:90]}")
+            action_skip.append((rid, title, f"multiple artists: {reason}"))
+    else:
+        artists_by_fid = {}
+
     print(f"\nLOW MATCH / OVERSIGHT: {len(action_skip)}")
     for rid, title, reason in action_skip[:5]:
         print(f"  ? {title[:55]} — {reason}")
@@ -496,6 +708,8 @@ def main():
     print(f"{'='*60}")
     print(f"Deleted & re-searched: {len(results['deleted'])}")
     print(f"Imported: {len(results['imported'])}")
+    print(f"Imported after resolving duplicate artists: {len(results['artist_resolved'])}"
+          f" ({len(results['artist_unresolved'])} left for oversight)")
     if results["import_failed"]:
         print(f"Import failed (deleted instead): {len(results['import_failed'])}")
     print(f"Skipped (oversight): {len(action_skip)}")
@@ -505,6 +719,16 @@ def main():
         print("\n--- Imported ---")
         for item in results["imported"][:15]:
             print(f"  + {item}")
+
+    if results["artist_resolved"]:
+        print("\n--- Imported after resolving duplicate artists ---")
+        for item in results["artist_resolved"][:15]:
+            print(f"  + {item}")
+
+    if results["artist_unresolved"]:
+        print(f"\n--- Duplicate artists, not resolved ({len(results['artist_unresolved'])}) ---")
+        for item in results["artist_unresolved"][:15]:
+            print(f"  ? {item}")
 
     if results["import_failed"]:
         print("\n--- Import Failed (deleted) ---")
@@ -580,7 +804,18 @@ def main():
         print(f"\n{'='*60}")
         print("PHASE 4: Cleaning up unmapped track files...")
         print(f"{'='*60}")
-        clean_unmapped_files(cfg)
+        clean_unmapped_files(dict(cfg, unmapped_files_dry_run=True) if DRY_RUN else cfg)
+
+    if duplicate_artists:
+        print(f"\n[AGENT_OVERSIGHT_NEEDED] {len(duplicate_artists)} duplicate artist name(s) "
+              f"block auto-import; merge or remove the spare artist in Lidarr")
+        for key, count in sorted(duplicate_artists.items(), key=lambda kv: -kv[1]):
+            parts = []
+            for fid, name in key:
+                a = artists_by_fid.get(fid) or {}
+                files = (a.get("statistics") or {}).get("trackFileCount") or 0
+                parts.append(f"artistId={a.get('id', '?')} {fid} ({files} files)")
+            print(f"[OVERSIGHT] duplicate artist '{key[0][1]}' | {' vs '.join(parts)} | {count} queue item(s)")
 
     # Signal edge cases for agent oversight
     total_oversight = len(action_unknown) + len(action_skip)

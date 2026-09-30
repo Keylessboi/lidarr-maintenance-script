@@ -39,6 +39,8 @@ Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cr
 | Feature | Description |
 |---------|-------------|
 | **Force import** | Albums that failed auto-import but should still work — re-attempts via Lidarr's manual import API with `move` mode |
+| **Duplicate-artist resolution** | Finished downloads Lidarr parks with `found multiple artists` (the same artist added twice, e.g. once from MusicBrainz and once as `…@deezer`) are matched against each candidate artist and imported with Lidarr's `ManualImport` command when exactly one album fits. The duplicate artists are listed under `[AGENT_OVERSIGHT_NEEDED]`, because merging them is the real fix |
+| **Dry run** | `DRY_RUN=1` classifies and resolves the whole queue but sends no POST or DELETE |
 | **Delete + re-search** | Genuinely broken downloads are removed from queue and Lidarr re-searches for a better copy |
 | **Agent oversight** | Ambiguous or low-confidence items get flagged with `[AGENT_OVERSIGHT_NEEDED]` for human/AI review |
 | **Stalled download cleanup** | qBittorrent/Soulseek/YouTube downloads stuck for N+ days are removed and re-searched. A download the client reports as merely `queued` is left alone — it is waiting for a download slot, not broken |
@@ -249,6 +251,7 @@ These are all the rejection messages Lidarr can produce during auto-import, sour
 | `"Has missing tracks"` | `NoMissingOrUnmatchedTracksSpecification.cs` — MusicBrainz has tracks not in this release | **Delete + re-search** — download is incomplete |
 | `"Has fewer tracks than existing release"` | `MoreTracksSpecification.cs` — Fewer tracks than what's already imported | **Delete + re-search** — worse than what you have |
 | `"One or more tracks expected"` | Generic wrapper (always appears with another reason) | **Delete + re-search** — when no specific reason exists underneath |
+| `"Unable to import automatically, found multiple artists"` | `TrackedDownloadService.cs` — the release's artist name matches more than one library artist | **Resolve artist** — see Decision Flow; not a keyword list, because it is raised before import and leaves the item in `downloading` |
 | `"Track file on disk contains more tracks than this file contains"` | `SameTracksImportSpecification.cs` | **Undefined** — not seen in wild; add to a list if encountered |
 | `"No tracks matched"` | `CloseAlbumMatchSpecification.cs` — Zero tracks matched the album | **Undefined** — not seen in wild; add to a list if encountered |
 | `"Album release not requested"` | `ReleaseWantedSpecification.cs` — Release isn't wanted | **Undefined** — not seen in wild; add to a list if encountered |
@@ -263,6 +266,14 @@ Messages are checked **in order** within each list. If an item's status messages
 
 ```
 Queue item
+├── statusMessages say "found multiple artists"?
+│   └── Yes → RESOLVE ARTIST (checked first: these carry no albumId, so the
+│       stale rule would delete a finished download and re-search nothing)
+│       ├── For each candidate artist: manualimport?downloadId=…&artistId=…
+│       ├── Keep candidates whose files map to ONE album and whose rejections
+│       │   pass the same keyword rules below (clean match preferred)
+│       ├── One qualifies → IMPORT via the ManualImport command
+│       └── None qualifies → FLAG FOR OVERSIGHT (+ duplicate artist report)
 ├── Has errorMessage matching client retrying_pattern?
 │   └── Yes + stale > retrying_delete_days → DELETE + re-search (retrying)
 ├── Has statusMessages?
