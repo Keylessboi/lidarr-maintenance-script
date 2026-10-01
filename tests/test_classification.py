@@ -83,6 +83,50 @@ def test_import_and_keywords():
     usable = record(trackedDownloadState="importFailed", status="completed")
     usable["statusMessages"] = [{"messages": ["Has unmatched tracks"]}]
     check("importFailed + import keyword", usable, "import")
+    # Importing these would replace equal-or-better library files.
+    for msg in ("Not an upgrade for existing album file(s)", "Album already imported"):
+        rec = record(trackedDownloadState="importFailed", status="completed")
+        rec["statusMessages"] = [{"messages": [msg]}]
+        check("importFailed + %s" % msg[:20], rec, "clear")
+
+
+def test_try_manual_import():
+    # The grabbed album is 1; the queue record's artist is 7.
+    seen = {}
+
+    def run(items, album_id=1, command_ok=True):
+        real_get, real_run = lq.api_get, lq.run_manual_import
+
+        def fake_get(path, params=None, timeout=None):
+            seen.update(params or {})
+            return items
+        lq.api_get = fake_get
+        lq.run_manual_import = lambda files: command_ok
+        try:
+            return lq.try_manual_import("abc", artist_id=7, album_id=album_id)
+        finally:
+            lq.api_get, lq.run_manual_import = real_get, real_run
+
+    cases = [
+        ("right album -> imported", run([_item(7, 1)]), True),
+        ("other album -> refused, left alone", run([_item(7, 2)]), None),
+        ("two albums -> refused", run([_item(7, 1), _item(7, 2)]), None),
+        ("nothing mapped -> failed", run([dict(_item(7, 1), album=None)]), False),
+        ("no files -> failed", run([]), False),
+        ("command fails -> failed", run([_item(7, 1)], command_ok=False), False),
+        ("no grabbed album -> imported", run([_item(7, 2)], album_id=None), True),
+    ]
+    for name, (outcome, why), want in cases:
+        if outcome is not want:
+            FAILURES.append("%s: expected %r, got %r (%s)" % (name, want, outcome, why))
+            print("  FAIL %s: expected %r, got %r (%s)" % (name, want, outcome, why))
+        else:
+            print("  ok   %-44s -> %r" % (name, outcome))
+    if seen.get("artistId") != 7:
+        FAILURES.append("try_manual_import did not pin artistId: %r" % seen)
+        print("  FAIL try_manual_import pins artistId")
+    else:
+        print("  ok   %-44s -> artistId=7" % "identification pinned to artist")
 
 
 MULTI = ("Unable to import automatically, found multiple artists: "
@@ -217,7 +261,7 @@ def test_pagination():
 if __name__ == "__main__":
     for fn in (test_stale, test_queued_is_not_stale, test_retrying,
                test_import_and_keywords, test_multiple_artists,
-               test_resolve_multiple_artists, test_pagination):
+               test_resolve_multiple_artists, test_try_manual_import, test_pagination):
         fn()
     if FAILURES:
         print("\n%d failure(s):" % len(FAILURES))

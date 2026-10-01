@@ -61,11 +61,19 @@ CONFIG = {
 
     # ── Action Lists ──
     # Move a keyword between lists to change its action.
-    # Priority order: import > import_if_match > delete > oversight
+    # Priority order (judge_messages): oversight > clear > import > import_if_match > delete
+
+    # Removed from the queue and the client, with no import and no re-search.
+    # The library already holds files at least this good, so importing would
+    # REPLACE them with these (Lidarr deletes the existing track files on a
+    # manual import) - a downgrade, or the same files again. Harmless while
+    # force-import was a no-op; not once it really imports.
+    "clear_keywords": [
+        "Not an upgrade for existing",           # UpgradeSpecification — existing files are equal or better
+        "Album already imported",                # AlreadyImportedSpecification — this download was imported before
+    ],
 
     "import_keywords": [
-        "Not an upgrade for existing",           # UpgradeSpecification — quality not better, but files are valid
-        "Album already imported",                # AlreadyImportedSpecification — was imported, just stuck in queue
         "Failed to import track, Destination already exists",  # File system — dest file exists, clean up queue
         "Has unmatched tracks",                  # NoMissingOrUnmatchedTracksSpecification — extra files, valid bonus content
         "could not find similar album",          # Folder/name mismatch, agent should match manually → import
@@ -176,25 +184,41 @@ def delete_queue_item(record_id, remove_from_client=True, album_id=None):
         api_post("command", {"name": "AlbumSearch", "albumIds": [album_id]})
 
 
-def try_manual_import(download_id):
-    """Attempt to force-import via Lidarr manual import API
+def try_manual_import(download_id, artist_id=None, album_id=None):
+    """Force-import a failed download with Lidarr's ManualImport command.
 
-    KNOWN NO-OP (2026-09-30): POST /manualimport only re-evaluates the items,
-    it does not import them - see run_manual_import(). Every "imported" item a
-    run reports from here is still in the queue the next night. Switching this
-    to run_manual_import() would start real imports for the first time,
-    including "Not an upgrade" ones that replace better files, so it is left
-    for the owner to decide rather than changed in passing.
+    Returns (outcome, reason), outcome being:
+      True  - imported
+      False - nothing importable, or the command failed: the download is bad
+      None  - refused, because importing could land files somewhere wrong;
+              leave the download alone and flag it
+
+    Until 2026-10-01 this POSTed the items back to /manualimport, which only
+    re-evaluates them (see run_manual_import()). Every "imported" item the
+    summary reported was still in the queue the next night.
+
+    Identification is pinned to the queue record's artist, and the files must
+    all land on the album that was grabbed. A low match score is the case this
+    path exists for, and also the case where Lidarr may have picked a
+    different album by the same artist.
     """
-    items = api_get(f"manualimport?downloadId={download_id}")
-    if not items or isinstance(items, dict) and items.get("error"):
-        return False
+    params = {"downloadId": download_id, "filterExistingFiles": True}
+    if artist_id:
+        params["artistId"] = artist_id
+    items = api_get("manualimport", params=params)
     if not isinstance(items, list) or not items:
-        return False
-    for item in items:
-        item["importMode"] = "move"
-    api_post("manualimport", items)
-    return True
+        return False, "no files to import"
+    files = importable_files(items)
+    if not files:
+        return False, "no file maps to an album"
+    albums = {f["albumId"] for f in files}
+    if len(albums) != 1:
+        return None, f"files span {len(albums)} albums"
+    if album_id and albums != {album_id}:
+        return None, f"files match albumId={albums.pop()}, grabbed albumId={album_id}"
+    if run_manual_import(files):
+        return True, ""
+    return False, "ManualImport command failed"
 
 
 # How long to wait for one ManualImport command. Lidarr runs disk-access
@@ -431,6 +455,7 @@ def classify_record(record, now, utc):
     added_str = record.get("added")
     download_id = record.get("downloadId", "")
     album_id = record.get("albumId")
+    artist_id = record.get("artistId")
     download_client = record.get("downloadClient", "")
 
     # Per-client config
@@ -499,7 +524,7 @@ def classify_record(record, now, utc):
 
     verdict, reason = judge_messages(status_messages, cc, bool(download_id))
     if verdict == "import":
-        return ("import", (record_id, download_id, title, reason, album_id))
+        return ("import", (record_id, download_id, title, reason, album_id, artist_id))
     if verdict == "delete":
         return ("delete", (record_id, title, reason, album_id))
     return (verdict, (record_id, title, reason))
@@ -520,6 +545,11 @@ def judge_messages(status_messages, cc, has_download_id=True):
             return ("skip", kw)
 
     # Check import keywords
+    # Check clear keywords (before import: importing these would downgrade)
+    for kw in CONFIG.get("clear_keywords", []):
+        if kw in sm_str:
+            return ("clear", kw)
+
     for kw in CONFIG["import_keywords"]:
         if kw in sm_str:
             return ("import", kw)
@@ -609,7 +639,8 @@ def main():
     now = datetime.now(timezone.utc)
     utc = timezone.utc
 
-    action_buckets = {"import": [], "delete": [], "skip": [], "unknown": [], "resolve_artist": []}
+    action_buckets = {"import": [], "delete": [], "skip": [], "unknown": [], "resolve_artist": [],
+                      "clear": []}
 
     for record in records:
         result = classify_record(record, now, utc)
@@ -623,6 +654,7 @@ def main():
     action_skip = action_buckets["skip"]
     action_unknown = action_buckets["unknown"]
     action_resolve = action_buckets["resolve_artist"]
+    action_clear = action_buckets["clear"]
 
     # Caps are applied AFTER classification, so the summary still reports how
     # much was matched and the log shows what was deferred. Whatever is left is
@@ -645,7 +677,8 @@ def main():
 
     # === EXECUTE ===
     results = {"imported": [], "import_failed": [], "deleted": [], "skipped": [], "unknown": [],
-               "artist_resolved": [], "artist_unresolved": []}
+               "artist_resolved": [], "artist_unresolved": [], "cleared": [],
+               "import_refused": [], "import_failed_deferred": []}
 
     print(f"PHASE 1: Deleting {len(action_delete)} items...", flush=True)
     for i, (rid, title, reason, album_id) in enumerate(action_delete, 1):
@@ -654,18 +687,36 @@ def main():
         if i % 50 == 0:
             print(f"  {i}/{len(action_delete)} deleted...", flush=True)
 
+    # No re-search: the library already has these at equal or better quality.
+    print(f"\nPHASE 1b: Clearing {len(action_clear)} items already covered by the library...", flush=True)
+    for rid, title, reason in action_clear:
+        delete_queue_item(rid, remove_from_client=True, album_id=None)
+        results["cleared"].append(f"{title[:55]} ({reason})")
+
+    # A failed import falls back to delete + re-search, and every re-search is
+    # an AlbumSearch on Lidarr's command queue - so those fallbacks share the
+    # delete cap with PHASE 1 instead of adding up to max_imports_per_run more.
+    delete_budget = max(0, cfg["max_deletes_per_run"] - len(action_delete))
+
     print(f"\nPHASE 2: Importing {len(action_import)} items...", flush=True)
-    for rid, did, title, reason, album_id in action_import:
+    for i, (rid, did, title, reason, album_id, artist_id) in enumerate(action_import, 1):
         if did:
-            success = try_manual_import(did)
-            if success:
-                results["imported"].append(f"{title[:55]} ({reason})")
-            else:
-                delete_queue_item(rid, remove_from_client=True, album_id=album_id)
-                results["import_failed"].append(f"{title[:55]} ({reason})")
+            outcome, why = try_manual_import(did, artist_id=artist_id, album_id=album_id)
         else:
+            outcome, why = False, "no downloadId"
+        if outcome:
+            results["imported"].append(f"{title[:55]} ({reason})")
+        elif outcome is None:
+            results["import_refused"].append(f"[{rid}] {title[:45]} | {why}")
+            action_skip.append((rid, title, f"import refused: {why}"))
+        elif delete_budget:
+            delete_budget -= 1
             delete_queue_item(rid, remove_from_client=True, album_id=album_id)
-            results["import_failed"].append(f"{title[:55]} (no downloadId)")
+            results["import_failed"].append(f"{title[:55]} ({reason}; {why})")
+        else:
+            results["import_failed_deferred"].append(f"{title[:55]} ({why})")
+        if i % 25 == 0:
+            print(f"  {i}/{len(action_import)} processed...", flush=True)
 
     # Resolving each download is the workaround; merging the duplicate artists
     # in Lidarr is the fix, and that is not a call for a script to make. Count
@@ -707,7 +758,12 @@ def main():
     print("SUMMARY")
     print(f"{'='*60}")
     print(f"Deleted & re-searched: {len(results['deleted'])}")
+    print(f"Cleared (library already has it): {len(results['cleared'])}")
     print(f"Imported: {len(results['imported'])}")
+    if results["import_refused"]:
+        print(f"Import refused (wrong or ambiguous album, left alone): {len(results['import_refused'])}")
+    if results["import_failed_deferred"]:
+        print(f"Import failed, delete deferred (delete cap reached): {len(results['import_failed_deferred'])}")
     print(f"Imported after resolving duplicate artists: {len(results['artist_resolved'])}"
           f" ({len(results['artist_unresolved'])} left for oversight)")
     if results["import_failed"]:
@@ -735,6 +791,16 @@ def main():
         for item in results["import_failed"][:10]:
             print(f"  ~ {item}")
 
+    if results["import_refused"]:
+        print("\n--- Import Refused (left in queue) ---")
+        for item in results["import_refused"][:10]:
+            print(f"  ? {item}")
+
+    if results["cleared"]:
+        print("\n--- Cleared ---")
+        for item in results["cleared"][:10]:
+            print(f"  = {item}")
+
     if results["deleted"]:
         print("\n--- Deleted ---")
         for item in results["deleted"][:10]:
@@ -750,7 +816,9 @@ def main():
     # the capped work list, and an entry in it can still fail and be deleted
     # instead. A live run on 2026-09-21 reported "500 imported" while the
     # summary above it correctly said 499 imported and 1 deleted.
-    print(f"\nDone. {len(results['deleted'])} deleted and {len(results['imported'])} imported "
+    imported = len(results["imported"]) + len(results["artist_resolved"])
+    deleted = len(results["deleted"]) + len(results["import_failed"])
+    print(f"\nDone. {deleted} deleted, {len(results['cleared'])} cleared and {imported} imported "
           f"out of a {total}-record queue.")
 
     # === PHASE 3: Find continuously missing albums ===

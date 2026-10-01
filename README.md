@@ -38,7 +38,8 @@ Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cr
 
 | Feature | Description |
 |---------|-------------|
-| **Force import** | Albums that failed auto-import but should still work — re-attempts via Lidarr's manual import API with `move` mode |
+| **Force import** | Albums that failed auto-import but should still work are imported with Lidarr's `ManualImport` command (`auto` mode: move for Soulseek/usenet, copy for torrents). Identification is pinned to the grabbed artist, and the files must land on the grabbed album, or the item is left alone and flagged. Until 2026-10-01 this POSTed to `/manualimport`, which only re-evaluates items, so nothing was ever imported |
+| **Clear already-covered** | `Not an upgrade` / `Album already imported` downloads are removed from the queue and client without importing — importing them would replace equal-or-better library files |
 | **Duplicate-artist resolution** | Finished downloads Lidarr parks with `found multiple artists` (the same artist added twice, e.g. once from MusicBrainz and once as `…@deezer`) are matched against each candidate artist and imported with Lidarr's `ManualImport` command when exactly one album fits. The duplicate artists are listed under `[AGENT_OVERSIGHT_NEEDED]`, because merging them is the real fix |
 | **Dry run** | `DRY_RUN=1` classifies and resolves the whole queue but sends no POST or DELETE |
 | **Delete + re-search** | Genuinely broken downloads are removed from queue and Lidarr re-searches for a better copy |
@@ -118,10 +119,14 @@ CONFIG = {
     "missing_album_scan_count": 10,  # how many oldest missing albums to check per run
     "missing_search_threshold": 2,   # searches >= this + zero grabs → flag problematic
 
-    # ── Action: FORCE IMPORT ──
-    "import_keywords": [              # items where the files probably exist and just need a nudge
+    # ── Action: CLEAR (remove from queue + client, no import, no re-search) ──
+    "clear_keywords": [               # the library already has these at equal or better quality
         "Not an upgrade for existing",
         "Album already imported",
+    ],
+
+    # ── Action: FORCE IMPORT ──
+    "import_keywords": [              # items where the files probably exist and just need a nudge
         "Failed to import track, Destination already exists",
         "Has unmatched tracks",
         "could not find similar album",
@@ -221,16 +226,17 @@ If a client is not listed, global thresholds apply and retrying detection is dis
 
 ### Action Lists
 
-There are four action lists, applied in priority order:
+There are five action lists (see the priority order below):
 
 | List | Action taken |
 |------|-------------|
-| `import_keywords` | Force import via Lidarr's manual import API. If the import API returns no files, falls back to delete + re-search. |
+| `clear_keywords` | Removes the queue item and the download, with no import and no re-search. For downloads the library already covers. |
+| `import_keywords` | Force import via Lidarr's `ManualImport` command. Files on a different album than the one grabbed (or spread over several) are left alone and flagged. Nothing importable, or a failed command, falls back to delete + re-search; those fallbacks share `max_deletes_per_run` with ordinary deletes, and any beyond it wait for the next run. |
 | `import_if_match_keywords` | Extracts the match percentage from the error message. If >= `match_import_min`, force imports. Otherwise, flags for oversight. |
 | `delete_keywords` | Deletes the queue item, optionally removing from the download client, and triggers `AlbumSearch` command for a re-search. |
 | `oversight_keywords` | No action taken. The item is printed with an `[AGENT_OVERSIGHT_NEEDED]` marker for human/AI review. |
 
-**Priority order matters.** Keywords in `import_keywords` are checked first, then `import_if_match_keywords`, then `delete_keywords`, then `oversight_keywords`. The first match wins. If no list matches, the item goes to "unknown" (also flagged for oversight).
+**Priority order matters.** Keywords in `oversight_keywords` are checked first, then `clear_keywords`, `import_keywords`, `import_if_match_keywords` and `delete_keywords`. The first match wins. If no list matches, the item goes to "unknown" (also flagged for oversight).
 
 The `sm_str` (stringified status messages) is matched with a simple `if kw in sm_str` check. Substring matching means partial matches work — `"Album match"` will match `"Album match is not close enough: 74.5 % vs 80 %"`.
 
@@ -240,8 +246,8 @@ These are all the rejection messages Lidarr can produce during auto-import, sour
 
 | Error message (substring match) | Source file | Default action |
 |--------------------------------|-------------|---------------|
-| `"Not an upgrade for existing"` | `UpgradeSpecification.cs` — Quality is same or worse than what's on disk | **Import** — files are valid, just not better quality |
-| `"Album already imported"` | `AlreadyImportedSpecification.cs` — Album was already imported before | **Import** — already in library, just stuck in queue |
+| `"Not an upgrade for existing"` | `UpgradeSpecification.cs` — Quality is same or worse than what's on disk | **Clear** — importing would replace better files |
+| `"Album already imported"` | `AlreadyImportedSpecification.cs` — This download was already imported before | **Clear** — already in library; re-importing could undo a later upgrade |
 | `"Failed to import track, Destination already exists"` | File system / import engine — destination file exists | **Import** — file is there, just needs queue cleanup |
 | `"Has unmatched tracks"` | `NoMissingOrUnmatchedTracksSpecification.cs` — Extra files Lidarr couldn't match | **Import** — extra tracks are usually valid bonus content |
 | `"could not find similar album"` | Folder/name resolution — Lidarr couldn't match path to an album | **Import** — agent should verify, but files likely belong |
@@ -281,6 +287,7 @@ Queue item
 ├── downloading + stale > N days (per-client)?
 │   └── Yes → DELETE + re-search (stalled)
 ├── importFailed?
+│   ├── Matches clear_keywords? → CLEAR (remove, no re-search)
 │   ├── Matches import_keywords? → FORCE IMPORT
 │   ├── Matches import_if_match_keywords?
 │   │   ├── Match % >= threshold (per-client) → FORCE IMPORT
@@ -315,17 +322,14 @@ Phase 3: Continuously Missing Albums
 
 Now items with 30-49% match will go to oversight instead of auto-import.
 
-### Move "not an upgrade" items to delete instead of import
+### Re-search "not an upgrade" items instead of just clearing them
 
-Move `"Not an upgrade for existing"` from `import_keywords` to `delete_keywords`:
+Move `"Not an upgrade for existing"` from `clear_keywords` to `delete_keywords`:
 
 ```python
-"import_keywords": [
+"clear_keywords": [
     # "Not an upgrade for existing",   <-- remove from here
     "Album already imported",
-    "Failed to import track, Destination already exists",
-    "Has unmatched tracks",
-    "could not find similar album",
 ],
 
 "delete_keywords": [
@@ -342,8 +346,6 @@ Move it to `oversight_keywords`:
 
 ```python
 "import_keywords": [
-    "Not an upgrade for existing",
-    "Album already imported",
     "Failed to import track, Destination already exists",
     # "Has unmatched tracks",  <-- remove from here
     "could not find similar album",
