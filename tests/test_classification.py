@@ -258,10 +258,88 @@ def test_pagination():
         print("  ok   %-44s -> surfaces the API error" % "pagination")
 
 
+def artist(aid, fid, files=0, albums=0, name="X"):
+    return {"id": aid, "foreignArtistId": fid, "artistName": name, "path": "/m/%s-%d" % (name, aid),
+            "statistics": {"trackFileCount": files, "albumCount": albums}}
+
+
+def check(label, ok, detail=""):
+    if ok:
+        print("  ok   %-44s" % label)
+    else:
+        FAILURES.append("%s %s" % (label, detail))
+        print("  FAIL %s %s" % (label, detail))
+
+
+def test_pick_spare_artists():
+    """The rule that decides which artist may be removed. The cases are the real
+    duplicate sets from the 2026-10-10 run."""
+    # Young Thug / Ken Carson / Offset: one artist holds files, the other none.
+    spares, _ = lq.pick_spare_artists([artist(97, "a", files=94, albums=71), artist(1296, "b")])
+    check("pick: one holder -> the empty one goes", [s["id"] for s in spares] == [1296], spares)
+    # Chris Travis: both hold files. A human chooses whose files win.
+    spares, _ = lq.pick_spare_artists([artist(519, "a", files=88), artist(946, "b", files=108)])
+    check("pick: two holders -> nothing removed", spares == [], spares)
+    # KIDS SEE GHOSTS: no files, one clearly fuller.
+    spares, _ = lq.pick_spare_artists([artist(165, "a", albums=4), artist(668, "b", albums=1)])
+    check("pick: no files -> the thinner one goes", [s["id"] for s in spares] == [668], spares)
+    # No files and no clear winner: leave it.
+    spares, _ = lq.pick_spare_artists([artist(1, "a", albums=2), artist(2, "b", albums=2)])
+    check("pick: no files, tie -> nothing removed", spares == [], spares)
+    # Three artists, one holder: both others go.
+    spares, _ = lq.pick_spare_artists([artist(1, "a"), artist(2, "b", files=5), artist(3, "c")])
+    check("pick: three artists, one holder", sorted(s["id"] for s in spares) == [1, 3], spares)
+
+
+def test_prune_duplicate_artists():
+    deleted = []
+    real_delete, real_get = lq.api_delete, lq.api_get
+    lq.api_delete = lambda path: deleted.append(path) or "{}"
+    lq.api_get = lambda path, params=None, timeout=None: {"error": "Not Found", "status": 404}
+    try:
+        def lib():
+            arts = [artist(97, "yt-good", files=94, albums=71, name="Young Thug"),
+                    artist(1296, "yt-spare", name="Young Thug"),
+                    artist(519, "ct-a", files=88, name="Chris Travis"),
+                    artist(946, "ct-b", files=108, name="Chris Travis")]
+            return {a["foreignArtistId"]: a for a in arts}
+        yt = (("yt-good", "Young Thug"), ("yt-spare", "Young Thug"))
+        ct = (("ct-a", "Chris Travis"), ("ct-b", "Chris Travis"))
+
+        by_fid = lib()
+        deleted.clear()
+        report = lq.prune_duplicate_artists([yt, ct], by_fid, set(), 5)
+        check("prune: removes the spare, keeps files",
+              deleted == ["artist/1296?deleteFiles=false&addImportListExclusion=false"], deleted)
+        check("prune: spare leaves the in-memory library", "yt-spare" not in by_fid and "yt-good" in by_fid)
+        check("prune: both-holders set is reported, not removed",
+              any("several artists hold files" in line for line in report), report)
+
+        by_fid = lib()
+        deleted.clear()
+        report = lq.prune_duplicate_artists([yt], by_fid, {1296}, 5)
+        check("prune: a spare that owns queue items is kept", deleted == [], deleted)
+
+        by_fid = lib()
+        deleted.clear()
+        report = lq.prune_duplicate_artists([yt], by_fid, set(), 0)
+        check("prune: the per-run cap is honoured", deleted == [] and "deferred" in report[0], report)
+
+        # Lidarr says the artist still exists after the DELETE: do not claim success.
+        lq.api_get = lambda path, params=None, timeout=None: {"id": 1296}
+        by_fid = lib()
+        report = lq.prune_duplicate_artists([yt], by_fid, set(), 5)
+        check("prune: a delete that did not take is flagged",
+              "yt-spare" in by_fid and report[0].startswith("!"), report)
+    finally:
+        lq.api_delete, lq.api_get = real_delete, real_get
+
+
 if __name__ == "__main__":
     for fn in (test_stale, test_queued_is_not_stale, test_retrying,
                test_import_and_keywords, test_multiple_artists,
-               test_resolve_multiple_artists, test_try_manual_import, test_pagination):
+               test_resolve_multiple_artists, test_try_manual_import, test_pagination,
+               test_pick_spare_artists, test_prune_duplicate_artists):
         fn()
     if FAILURES:
         print("\n%d failure(s):" % len(FAILURES))

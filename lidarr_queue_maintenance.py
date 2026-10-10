@@ -33,6 +33,15 @@ CONFIG = {
     "max_deletes_per_run": 50,
     "max_imports_per_run": 500,
 
+    # ── Duplicate-artist pruning ──
+    # A duplicate set that is blocking queue items ("found multiple artists") is
+    # fixed at the source: the spare artist is removed from Lidarr, so the
+    # next import is unambiguous. Library FILES are never deleted. A spare is
+    # removed only when the set has exactly one artist holding files (or, when
+    # none does, one clearly fuller artist); see prune_duplicate_artists().
+    "prune_duplicate_artists": True,         # set False to only report
+    "max_artist_prunes_per_run": 5,
+
     # ── Unmapped Files Cleaner ──
     # Deletes orphaned track files that aren't linked to any album in Lidarr.
     "unmapped_files_cleaner_enabled": True,   # set False to skip
@@ -353,6 +362,82 @@ def resolve_multiple_artists(download_id, candidates, artists_by_fid, cc):
     if best is None:
         return None, None, "; ".join(tried) or "no candidate artist resolved"
     return best[1], best[2], best[3]
+
+
+def pick_spare_artists(group):
+    """Which artists of one duplicate set are safe to remove.
+
+    `group` is the library artist dicts that share a name. Returns
+    (spares, reason); spares is [] when the set must be left to a human.
+
+    The rule is deliberately narrow, because removing an artist is the one
+    thing here that cannot be undone from the queue:
+      - exactly one artist holds files: every other one is a spare (they hold
+        none, so nothing on disk is orphaned);
+      - several hold files (the same person split across two folders): leave
+        them, a human has to choose whose files win;
+      - none holds files: the fullest artist (most albums, then oldest) is
+        kept and only artists with STRICTLY fewer albums are spares. A tie is
+        left alone.
+    """
+    def stat(a, key):
+        return (a.get("statistics") or {}).get(key) or 0
+
+    holders = [a for a in group if stat(a, "trackFileCount") > 0]
+    if len(holders) > 1:
+        return [], "several artists hold files"
+    if len(holders) == 1:
+        keeper = holders[0]
+        return ([a for a in group if a["id"] != keeper["id"]],
+                f"keeping artistId={keeper['id']} (the only one with files)")
+    keeper = max(group, key=lambda a: (stat(a, "albumCount"), -a["id"]))
+    spares = [a for a in group if stat(a, "albumCount") < stat(keeper, "albumCount")]
+    if not spares:
+        return [], "no artist has files and none is clearly fuller"
+    return spares, f"keeping artistId={keeper['id']} (no files anywhere; most albums)"
+
+
+def prune_duplicate_artists(dup_sets, artists_by_fid, queue_artist_ids, limit):
+    """Remove the spare artist from each duplicate set that blocks the queue.
+
+    dup_sets: iterable of candidate tuples [(foreignArtistId, name), ...], one
+    per distinct set, as parsed from the "found multiple artists" warnings.
+    queue_artist_ids: ids of artists that own queue items. A spare with its own
+    queue items is kept - removing it would orphan those downloads.
+
+    Removes with deleteFiles=false, and never adds an import-list exclusion, so
+    a wrongly removed artist can be added back. artists_by_fid is updated in
+    place. Returns a list of report lines.
+    """
+    report = []
+    pruned = 0
+    for candidates in dup_sets:
+        group = [artists_by_fid[fid] for fid, _ in candidates if fid in artists_by_fid]
+        if len(group) < 2:
+            continue
+        name = group[0].get("artistName")
+        spares, why = pick_spare_artists(group)
+        if not spares:
+            report.append(f"? '{name}': left alone ({why})")
+            continue
+        for spare in spares:
+            tag = f"'{name}' artistId={spare['id']} [{spare.get('foreignArtistId')}] {spare.get('path')}"
+            if spare["id"] in queue_artist_ids:
+                report.append(f"? {tag}: kept, it owns queue items")
+                continue
+            if pruned >= limit:
+                report.append(f"? {tag}: deferred, max_artist_prunes_per_run reached")
+                continue
+            api_delete(f"artist/{spare['id']}?deleteFiles=false&addImportListExclusion=false")
+            # api_delete reports failures as strings that are hard to tell from
+            # success, so ask Lidarr whether the artist is gone.
+            if not DRY_RUN and api_get(f"artist/{spare['id']}").get("status") != 404:
+                report.append(f"! {tag}: delete did not take effect")
+                continue
+            pruned += 1
+            artists_by_fid.pop(spare.get("foreignArtistId"), None)
+            report.append(f"- {tag}: removed, {why}")
+    return report
 
 
 def parse_match_pct(status_messages):
@@ -718,20 +803,35 @@ def main():
         if i % 25 == 0:
             print(f"  {i}/{len(action_import)} processed...", flush=True)
 
-    # Resolving each download is the workaround; merging the duplicate artists
-    # in Lidarr is the fix, and that is not a call for a script to make. Count
-    # the queue items per duplicate set so the oversight report can say so.
+    # Resolving each download is the workaround; removing the spare artist is
+    # the fix, so do that first where it is unambiguous (PHASE 2a) and only
+    # resolve per download what is left. Sets that cannot be pruned safely are
+    # counted per set so the oversight report can say so.
     duplicate_artists = {}
-    print(f"\nPHASE 2b: Resolving {len(action_resolve)} multiple-artist items...", flush=True)
+    prune_report = []
+    artists_by_fid = {}
     if action_resolve:
         library = api_get("artist")
         artists_by_fid = ({a.get("foreignArtistId"): a for a in library}
                           if isinstance(library, list) else {})
         if not artists_by_fid:
-            print(f"  Could not fetch the artist list: {library}", flush=True)
+            print(f"\nCould not fetch the artist list: {library}", flush=True)
+    if action_resolve and artists_by_fid and cfg["prune_duplicate_artists"]:
+        dup_sets = {tuple(sorted(c)) for _, _, _, c, _ in action_resolve}
+        queue_artist_ids = {r.get("artistId") for r in records if r.get("artistId")}
+        print(f"\nPHASE 2a: Pruning spare artists from {len(dup_sets)} duplicate set(s)...", flush=True)
+        prune_report = prune_duplicate_artists(
+            dup_sets, artists_by_fid, queue_artist_ids, cfg["max_artist_prunes_per_run"])
+        for line in prune_report:
+            print(f"  {line}", flush=True)
+
+    print(f"\nPHASE 2b: Resolving {len(action_resolve)} multiple-artist items...", flush=True)
+    if action_resolve:
         for rid, did, title, candidates, client in action_resolve:
-            key = tuple(sorted(candidates))
-            duplicate_artists[key] = duplicate_artists.get(key, 0) + 1
+            # A set pruned down to one library artist is no longer a duplicate.
+            if sum(1 for fid, _ in candidates if fid in artists_by_fid) > 1:
+                key = tuple(sorted(candidates))
+                duplicate_artists[key] = duplicate_artists.get(key, 0) + 1
             if not artists_by_fid:
                 continue
             if not did:
@@ -746,8 +846,6 @@ def main():
             reason = f"ManualImport failed ({why})" if files else why
             results["artist_unresolved"].append(f"[{rid}] {title[:45]} | {reason[:90]}")
             action_skip.append((rid, title, f"multiple artists: {reason}"))
-    else:
-        artists_by_fid = {}
 
     print(f"\nLOW MATCH / OVERSIGHT: {len(action_skip)}")
     for rid, title, reason in action_skip[:5]:
@@ -764,6 +862,9 @@ def main():
         print(f"Import refused (wrong or ambiguous album, left alone): {len(results['import_refused'])}")
     if results["import_failed_deferred"]:
         print(f"Import failed, delete deferred (delete cap reached): {len(results['import_failed_deferred'])}")
+    removed_spares = sum(1 for line in prune_report if line.startswith("- "))
+    if removed_spares:
+        print(f"Spare duplicate artists removed: {removed_spares} (files kept)")
     print(f"Imported after resolving duplicate artists: {len(results['artist_resolved'])}"
           f" ({len(results['artist_unresolved'])} left for oversight)")
     if results["import_failed"]:
@@ -876,7 +977,7 @@ def main():
 
     if duplicate_artists:
         print(f"\n[AGENT_OVERSIGHT_NEEDED] {len(duplicate_artists)} duplicate artist name(s) "
-              f"block auto-import; merge or remove the spare artist in Lidarr")
+              f"block auto-import and were not safe to prune; merge or remove the spare artist in Lidarr")
         for key, count in sorted(duplicate_artists.items(), key=lambda kv: -kv[1]):
             parts = []
             for fid, name in key:

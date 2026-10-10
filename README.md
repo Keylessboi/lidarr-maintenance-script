@@ -40,7 +40,7 @@ Automated Lidarr queue cleanup with agentic oversight. Runs daily at 2 AM via cr
 |---------|-------------|
 | **Force import** | Albums that failed auto-import but should still work are imported with Lidarr's `ManualImport` command (`auto` mode: move for Soulseek/usenet, copy for torrents). Identification is pinned to the grabbed artist, and the files must land on the grabbed album, or the item is left alone and flagged. Until 2026-10-01 this POSTed to `/manualimport`, which only re-evaluates items, so nothing was ever imported |
 | **Clear already-covered** | `Not an upgrade` / `Album already imported` downloads are removed from the queue and client without importing — importing them would replace equal-or-better library files |
-| **Duplicate-artist resolution** | Finished downloads Lidarr parks with `found multiple artists` (the same artist added twice, e.g. once from MusicBrainz and once as `…@deezer`) are matched against each candidate artist and imported with Lidarr's `ManualImport` command when exactly one album fits. The duplicate artists are listed under `[AGENT_OVERSIGHT_NEEDED]`, because merging them is the real fix |
+| **Duplicate-artist resolution** | Finished downloads Lidarr parks with `found multiple artists` (the same artist added twice, e.g. once from MusicBrainz and once as `…@deezer`) are fixed at the source first: the spare artist is removed from Lidarr (files are never deleted) when that is unambiguous - exactly one artist of the set holds files, or none does and one has clearly more albums. A spare that owns queue items, a set where several artists hold files, and a tie are left alone and listed under `[AGENT_OVERSIGHT_NEEDED]`. Whatever remains is matched against each candidate artist and imported with Lidarr's `ManualImport` command when exactly one album fits |
 | **Dry run** | `DRY_RUN=1` classifies and resolves the whole queue but sends no POST or DELETE |
 | **Delete + re-search** | Genuinely broken downloads are removed from queue and Lidarr re-searches for a better copy |
 | **Agent oversight** | Ambiguous or low-confidence items get flagged with `[AGENT_OVERSIGHT_NEEDED]` for human/AI review |
@@ -161,6 +161,8 @@ CONFIG = {
 | `queue_page_size` | `500` | Records per queue PAGE. The queue is paginated until every record has been fetched, so this is not a ceiling on how much of the queue is seen. Lower = smaller JSON payloads; higher = fewer requests (Lidarr takes ~46s to serve 1,000 records). |
 | `max_deletes_per_run` | `50` | Cap on delete + re-search actions per run. Every delete fires an `AlbumSearch`, so this bounds how much search load one run can create. Leftovers are picked up by the next run, oldest first. |
 | `max_imports_per_run` | `500` | Cap on force-import attempts per run, keeping runtime and Lidarr load predictable. |
+| `prune_duplicate_artists` | `True` | Remove the spare artist from a duplicate set that blocks queue items (`pick_spare_artists()` has the rule). Files are never deleted and no import-list exclusion is added. `False` only reports. |
+| `max_artist_prunes_per_run` | `5` | Cap on spare artists removed per run. |
 | `missing_album_scan_count` | `10` | How many of the oldest missing albums to check per run. Kept low to avoid API rate issues. |
 | `missing_search_threshold` | `2` | If a missing album has been searched this many times with zero successful grabs, flag it as a potential naming issue. |
 
@@ -275,7 +277,8 @@ Queue item
 ├── statusMessages say "found multiple artists"?
 │   └── Yes → RESOLVE ARTIST (checked first: these carry no albumId, so the
 │       stale rule would delete a finished download and re-search nothing)
-│       ├── For each candidate artist: manualimport?downloadId=…&artistId=…
+│       ├── PHASE 2a first: remove the spare artist if the set is unambiguous
+│       ├── For each remaining candidate: manualimport?downloadId=…&artistId=…
 │       ├── Keep candidates whose files map to ONE album and whose rejections
 │       │   pass the same keyword rules below (clean match preferred)
 │       ├── One qualifies → IMPORT via the ManualImport command
